@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mv Table.xlsx f500_growth.xlsx historical_state_population_by_year.csv \"ncses_table_formatted_data_SGRD_2026-02-27T20_42_43Z.xlsx\" \"Raw Data/\")",
+      "Bash(mv merged_data.csv correlation.csv \"Clean Data/\")",
+      "Bash(mv \"CS 329E DV Analysis.pdf\" \"CS 329E DV Proposal-1.pdf\" \"Project Docs/\")",
+      "Bash(/Users/robpaine/anaconda3/bin/pip install:*)",
+      "Bash(python3 -c \"import panel; print\\(panel.__version__\\)\")",
+      "Bash(python3 -c \"import plotly; print\\('plotly', plotly.__version__\\)\")",
+      "Bash(python3 -c \"import altair; print\\('altair', altair.__version__\\)\")",
+      "Bash(python3 -c ':*)",
+      "Bash(pip install:*)",
+      "Bash(pip3 install:*)",
+      "Bash(/Users/robpaine/Library/Python/3.9/bin/voila \"/Users/robpaine/Downloads/Data Viz Project/Dashboard/dashboard.ipynb\" --no-browser)",
+      "Bash(kill 72909)",
+      "Bash(/Users/robpaine/Library/Python/3.9/bin/voila \"/Users/robpaine/Downloads/Data Viz Project/Dashboard/dashboard.ipynb\" --no-browser --VoilaConfiguration.file_allowlist=\"['.*\\\\\\\\.html']\")",
+      "Bash(python3 export_dashboard.py)"
+    ]
+  }
+}
