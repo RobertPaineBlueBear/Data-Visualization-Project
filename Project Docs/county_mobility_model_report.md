@@ -67,11 +67,9 @@ The cluster view is exploratory. It uses KMeans on standardized county traits an
 
 | cluster_label        |   counties |   avg_mobility |   avg_start_index |   avg_current_index |   avg_bachelors |   avg_gdp_per_capita |   avg_poverty |
 |:---------------------|-----------:|---------------:|------------------:|--------------------:|----------------:|---------------------:|--------------:|
-| high-skill breakouts |          9 |           64.9 |             146.1 |               211.0 |            60.0 |             264394.8 |          10.5 |
-| affluent incumbents  |        135 |           20.6 |             106.3 |               126.9 |            47.3 |              89652.8 |           8.1 |
-| growth metros        |        332 |           -2.9 |              94.4 |                91.5 |            35.0 |              70865.4 |          10.8 |
-| stable middle        |        332 |           -4.0 |              80.8 |                76.8 |            23.0 |              51572.0 |          13.4 |
-| relative decliners   |        174 |          -10.7 |              83.4 |                72.8 |            24.5 |              60723.8 |          18.7 |
+| high-skill breakouts |        452 |           13.1 |              95.6 |               113.3 |            39.5 |              82699.2 |           9.0 |
+| affluent incumbents  |        984 |            7.1 |              59.9 |                67.1 |            17.0 |              44017.6 |          20.0 |
+| growth metros        |       1619 |           -3.1 |              85.2 |                82.0 |            23.7 |              69869.2 |          12.2 |
 
 ## State Mobility Differences
 

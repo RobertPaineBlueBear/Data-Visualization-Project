@@ -486,23 +486,52 @@ def metro_mobility_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def cluster_counties(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    # For clustering, use the broad county coverage dataset so the clusters are
+    # not dominated by missingness from sparse specialty variables.
+    broad = pd.read_csv(CLEAN / "county_income_breakouts_1969_2024.csv", dtype={"county_fips": str})
+    story = pd.read_csv(CLEAN / "county_story_2023.csv", dtype={"county_fips": str})
+    broad = broad.rename(
+        columns={
+            "income_index_start": "income_index_1969_1973",
+            "income_index_end": "income_index_2020_2024",
+            "income_index_change": "mobility_5yr_avg",
+            "population_change_pct": "population_growth_pct",
+        }
+    )
+    broad = broad.merge(
+        story[
+            [
+                "county_fips",
+                "bachelors_or_higher_pct",
+                "median_household_income",
+                "poverty_pct",
+                "county_gdp_per_capita",
+                "acs_population",
+            ]
+        ],
+        on="county_fips",
+        how="left",
+    )
+    broad["population_2024"] = broad["population_end"]
+
     cluster_features = [
         "income_index_1969_1973",
         "mobility_5yr_avg",
         "population_growth_pct",
         "bachelors_or_higher_pct",
-        "management_science_arts_occupation_pct",
+        "median_household_income",
         "county_gdp_per_capita",
         "poverty_pct",
-        "median_age",
-        "unemployment_pct",
-        "median_home_value",
     ]
-    cluster_df = df.dropna(subset=cluster_features).copy()
+    cluster_df = broad.dropna(subset=cluster_features).copy()
+    # Prevent a single extreme county from becoming its own cluster.
+    for col in cluster_features:
+        lo, hi = cluster_df[col].quantile([0.01, 0.99])
+        cluster_df[col] = cluster_df[col].clip(lo, hi)
     x = StandardScaler().fit_transform(cluster_df[cluster_features])
     pca = PCA(n_components=2, random_state=42)
     coords = pca.fit_transform(x)
-    kmeans = KMeans(n_clusters=5, random_state=42, n_init=30)
+    kmeans = KMeans(n_clusters=3, random_state=42, n_init=30)
     cluster_df["cluster"] = kmeans.fit_predict(x)
     cluster_df["pca_1"] = coords[:, 0]
     cluster_df["pca_2"] = coords[:, 1]
@@ -515,6 +544,7 @@ def cluster_counties(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             avg_start_index=("income_index_1969_1973", "mean"),
             avg_current_index=("income_index_2020_2024", "mean"),
             avg_bachelors=("bachelors_or_higher_pct", "mean"),
+            avg_median_income=("median_household_income", "mean"),
             avg_gdp_per_capita=("county_gdp_per_capita", "mean"),
             avg_poverty=("poverty_pct", "mean"),
             avg_population_growth=("population_growth_pct", "mean"),
@@ -534,6 +564,7 @@ def cluster_counties(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         labels[cluster] = label
     cluster_df["cluster_label"] = cluster_df["cluster"].map(labels)
     summary["cluster_label"] = summary["cluster"].map(labels)
+    summary["counties_coverage_pct"] = summary["counties"] / broad["county_fips"].nunique() * 100
     summary["pca_explained_variance_1"] = pca.explained_variance_ratio_[0]
     summary["pca_explained_variance_2"] = pca.explained_variance_ratio_[1]
     return cluster_df, summary

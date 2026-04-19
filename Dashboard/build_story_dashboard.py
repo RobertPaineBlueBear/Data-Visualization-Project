@@ -36,6 +36,7 @@ from __future__ import annotations
 import base64
 import json
 import textwrap
+import warnings
 import zipfile
 from pathlib import Path
 
@@ -45,6 +46,13 @@ import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.offline import get_plotlyjs_version
 from plotly.subplots import make_subplots
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegressionCV
+from sklearn.metrics import accuracy_score, roc_auc_score, silhouette_score
+from sklearn.mixture import GaussianMixture
+from sklearn.neighbors import KernelDensity
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -434,6 +442,111 @@ def county_gdp_breakouts(
     return out.sort_values("gdp_index_change", ascending=False)
 
 
+def county_quality_of_life_index(county: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a county-level quality-of-life index from available county indicators.
+    Score is percentile-scaled to [0, 100] so it is easy to interpret.
+    """
+    base = county[
+        [
+            "county_fips",
+            "bea_county_name",
+            "state_name",
+            "acs_population",
+            "median_household_income",
+            "poverty_pct",
+            "bachelors_or_higher_pct",
+            "county_gdp_per_capita",
+        ]
+    ].copy()
+
+    mobility_path = CLEAN / "county_mobility_ml_dataset.csv"
+    if mobility_path.exists():
+        mobility = pd.read_csv(
+            mobility_path,
+            dtype={"county_fips": str},
+            usecols=[
+                "county_fips",
+                "broadband_pct",
+                "unemployment_pct",
+                "mean_commute_minutes",
+                "worked_from_home_pct",
+            ],
+        )
+        base = base.merge(mobility, on="county_fips", how="left")
+
+    metric_specs = [
+        ("median_household_income", 1.0, 1),
+        ("bachelors_or_higher_pct", 1.0, 1),
+        ("poverty_pct", 1.0, -1),
+        ("county_gdp_per_capita", 0.8, 1),
+        ("broadband_pct", 0.8, 1),
+        ("unemployment_pct", 0.8, -1),
+        ("mean_commute_minutes", 0.6, -1),
+        ("worked_from_home_pct", 0.5, 1),
+    ]
+
+    component_cols: list[str] = []
+    weight_cols: list[str] = []
+    for col, weight, direction in metric_specs:
+        if col not in base.columns:
+            continue
+        series = pd.to_numeric(base[col], errors="coerce")
+        if series.notna().mean() < 0.4:
+            continue
+
+        lower = series.quantile(0.05)
+        upper = series.quantile(0.95)
+        clipped = series.clip(lower=lower, upper=upper)
+        std = clipped.std(ddof=0)
+        if std == 0 or np.isnan(std):
+            continue
+
+        z = (clipped - clipped.mean()) / std
+        z = z * direction
+        component_col = f"qol_component_{col}"
+        weight_col = f"qol_weight_{col}"
+        base[component_col] = z
+        base[weight_col] = np.where(z.notna(), weight, 0.0)
+        component_cols.append(component_col)
+        weight_cols.append(weight_col)
+
+    if not component_cols:
+        out = base[["county_fips", "bea_county_name", "state_name", "acs_population"]].copy()
+        out["qol_raw_score"] = np.nan
+        out["qol_score_0_100"] = np.nan
+        out["qol_tier"] = "Insufficient data"
+        out["qol_components_used"] = 0
+        return out
+
+    weight_sum = base[weight_cols].sum(axis=1)
+    weighted_sum = np.zeros(len(base))
+    for component_col, weight_col in zip(component_cols, weight_cols):
+        weighted_sum += base[component_col].fillna(0.0) * base[weight_col]
+    base["qol_raw_score"] = np.where(weight_sum > 0, weighted_sum / weight_sum, np.nan)
+    base["qol_score_0_100"] = base["qol_raw_score"].rank(pct=True) * 100
+    base["qol_components_used"] = (base[weight_cols] > 0).sum(axis=1)
+    base["qol_tier"] = pd.cut(
+        base["qol_score_0_100"],
+        bins=[-np.inf, 20, 40, 60, 80, np.inf],
+        labels=["Very low", "Low", "Mid", "High", "Very high"],
+    ).astype(str)
+    base.loc[base["qol_score_0_100"].isna(), "qol_tier"] = "Insufficient data"
+
+    return base[
+        [
+            "county_fips",
+            "bea_county_name",
+            "state_name",
+            "acs_population",
+            "qol_raw_score",
+            "qol_score_0_100",
+            "qol_tier",
+            "qol_components_used",
+        ]
+    ].copy()
+
+
 def county_gdp_index_panel(gdp_panel: pd.DataFrame, income_panel: pd.DataFrame) -> pd.DataFrame:
     population = income_panel[["county_fips", "year", "population", "state_name"]].copy()
     panel = gdp_panel.merge(population, on=["county_fips", "year"], how="left")
@@ -452,6 +565,7 @@ def county_gdp_index_panel(gdp_panel: pd.DataFrame, income_panel: pd.DataFrame) 
 
 
 def enrich_data() -> tuple[
+    pd.DataFrame,
     pd.DataFrame,
     pd.DataFrame,
     pd.DataFrame,
@@ -509,6 +623,7 @@ def enrich_data() -> tuple[
     county_concentration = county_concentration_metrics(county_gdp_panel)
     income_breakouts = county_income_breakouts(county_income_panel)
     gdp_breakouts = county_gdp_breakouts(county_gdp_panel, county_income_panel)
+    county_qol = county_quality_of_life_index(county)
 
     CLEAN.mkdir(exist_ok=True)
     state_compounding.to_csv(CLEAN / "state_compounding_metrics.csv", index=False)
@@ -517,6 +632,7 @@ def enrich_data() -> tuple[
     gdp_breakouts.to_csv(CLEAN / "county_gdp_breakouts_2001_2024.csv", index=False)
     latest.to_csv(CLEAN / "state_story_2023.csv", index=False)
     county.to_csv(CLEAN / "county_story_2023.csv", index=False)
+    county_qol.to_csv(CLEAN / "county_quality_of_life_index.csv", index=False)
     return (
         merged,
         latest,
@@ -527,6 +643,7 @@ def enrich_data() -> tuple[
         gdp_breakouts,
         county_income_panel,
         county_gdp_index,
+        county_qol,
     )
 
 
@@ -1446,7 +1563,7 @@ def county_breakout_atlas(mode: str = "mobility", show_buttons: bool = True) -> 
             )
         ],
     )
-    return plot_layout(fig, height=560)
+    return plot_layout(fig, height=700)
 
 
 ATLAS_STORY_OVERRIDES = {
@@ -1544,8 +1661,10 @@ def atlas_story_records(limit_each: int = 18) -> list[dict[str, object]]:
 
 
 def metro_nonmetro_lens() -> go.Figure:
-    summary_path = CLEAN / "county_mobility_metro_summary.csv"
-    if not summary_path.exists():
+    breakouts_path = CLEAN / "county_income_breakouts_1969_2024.csv"
+    rucc_path = RAW / "2023-rural-urban-continuum-codes.csv"
+    fallback_path = CLEAN / "county_mobility_ml_dataset.csv"
+    if not breakouts_path.exists() and not fallback_path.exists():
         fig = go.Figure()
         fig.add_annotation(
             text="Run Dashboard/analyze_county_mobility.py after downloading USDA Rural-Urban Continuum Codes.",
@@ -1555,7 +1674,6 @@ def metro_nonmetro_lens() -> go.Figure:
         )
         return plot_layout(fig, height=520)
 
-    summary = pd.read_csv(summary_path)
     order = [
         "Metro, 1M+",
         "Metro, 250k-1M",
@@ -1567,70 +1685,218 @@ def metro_nonmetro_lens() -> go.Figure:
         "Nonmetro rural, adjacent",
         "Nonmetro rural, remote",
     ]
-    summary["rucc_group"] = pd.Categorical(summary["rucc_group"], categories=order, ordered=True)
-    summary = summary.sort_values("rucc_group")
 
-    top100_total = summary["top_100_mobility_count"].sum()
-    if top100_total > 0:
-        summary["top_100_share"] = summary["top_100_mobility_count"] / top100_total * 100
-    else:
-        summary["top_100_share"] = 0.0
-
-    fig = go.Figure()
-    bar_colors = [COLORS["teal"] if v >= 0 else COLORS["red"] for v in summary["pop_weighted_mobility"]]
-    fig.add_trace(
-        go.Bar(
-            x=summary["pop_weighted_mobility"],
-            y=summary["rucc_group"],
-            orientation="h",
-            marker=dict(color=bar_colors, line=dict(color="#ffffff", width=0.8)),
-            text=[f"{v:.0f}" for v in summary["top_100_mobility_count"]],
-            textposition="outside",
-            customdata=np.stack(
-                [
-                    summary["counties"],
-                    summary["population_2024"],
-                    summary["median_mobility"],
-                    summary["top_100_mobility_count"],
-                    summary["avg_bachelors"],
-                    summary["top_100_share"],
-                ],
-                axis=-1,
-            ),
-            hovertemplate=(
-                "<b>%{y}</b><br>"
-                "Population-weighted mobility: %{x:+.1f}<br>"
-                "Median county mobility: %{customdata[2]:+.1f}<br>"
-                "Counties: %{customdata[0]:,.0f}<br>"
-                "2024 population: %{customdata[1]:,.0f}<br>"
-                "Top-100 mobility counties: %{customdata[3]:,.0f}<br>"
-                "Share of top-100 mobility counties: %{customdata[5]:.1f}%<br>"
-                "Average bachelor's share: %{customdata[4]:.1f}%<extra></extra>"
-            ),
-            name="RUCC groups",
-            showlegend=False,
+    if breakouts_path.exists() and rucc_path.exists():
+        counties = pd.read_csv(breakouts_path, dtype={"county_fips": str})
+        counties = counties.rename(
+            columns={
+                "income_index_change": "mobility_5yr_avg",
+                "population_end": "population_2024",
+            }
         )
-    )
-    fig.add_vline(x=0, line_color=COLORS["ink"], line_width=1, line_dash="dot")
+        rucc_raw = pd.read_csv(rucc_path, dtype={"FIPS": str}, encoding="latin1")
+        rucc_wide = (
+            rucc_raw.pivot_table(
+                index=["FIPS", "State", "County_Name"],
+                columns="Attribute",
+                values="Value",
+                aggfunc="first",
+            )
+            .reset_index()
+            .rename_axis(None, axis=1)
+            .rename(columns={"FIPS": "county_fips", "RUCC_2023": "rucc_2023", "Description": "rucc_description"})
+        )
+        rucc_wide["county_fips"] = rucc_wide["county_fips"].str.zfill(5)
+        rucc_wide["rucc_2023"] = pd.to_numeric(rucc_wide["rucc_2023"], errors="coerce")
+        group_map = {
+            1: "Metro, 1M+",
+            2: "Metro, 250k-1M",
+            3: "Metro, <250k",
+            4: "Nonmetro urban, adjacent",
+            5: "Nonmetro urban, remote",
+            6: "Nonmetro town, adjacent",
+            7: "Nonmetro town, remote",
+            8: "Nonmetro rural, adjacent",
+            9: "Nonmetro rural, remote",
+        }
+        rucc_wide["rucc_group"] = rucc_wide["rucc_2023"].map(group_map)
+        counties = counties.merge(
+            rucc_wide[["county_fips", "rucc_group"]],
+            on="county_fips",
+            how="left",
+        )
+    else:
+        counties = pd.read_csv(fallback_path)
+
+    counties = counties.dropna(subset=["rucc_group", "mobility_5yr_avg"]).copy()
+    counties["rucc_group"] = pd.Categorical(counties["rucc_group"], categories=order, ordered=True)
+    counties = counties.sort_values("rucc_group")
+    if counties.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No RUCC-county mobility rows available.", showarrow=False, x=0.5, y=0.5)
+        return plot_layout(fig, height=520)
+
+    counts = counties.groupby("rucc_group", observed=False)["county_fips"].count()
+
+    # Display-only trimming: only drop ultra-rare leverage points (1-2 outliers per group)
+    # so the density shape is readable without flattening genuine heavy tails.
+    filtered_frames = []
+    removed_outliers = 0
+    for group in order:
+        subset = counties[counties["rucc_group"] == group].copy()
+        if subset.empty:
+            continue
+        values = subset["mobility_5yr_avg"].astype(float)
+        q1 = values.quantile(0.25)
+        q3 = values.quantile(0.75)
+        iqr = q3 - q1
+        if pd.isna(iqr) or iqr <= 0:
+            filtered_frames.append(subset)
+            continue
+        lower = q1 - 3.0 * iqr
+        upper = q3 + 3.0 * iqr
+        outlier_mask = (values < lower) | (values > upper)
+        outlier_count = int(outlier_mask.sum())
+        if 1 <= outlier_count <= 2:
+            subset = subset.loc[~outlier_mask].copy()
+            removed_outliers += outlier_count
+        filtered_frames.append(subset)
+
+    counties = pd.concat(filtered_frames, ignore_index=True)
+    if counties.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No rows left after outlier filtering.", showarrow=False, x=0.5, y=0.5)
+        return plot_layout(fig, height=520)
+
+    def to_rgba(hex_color: str, alpha: float) -> str:
+        hex_color = hex_color.lstrip("#")
+        if len(hex_color) != 6:
+            return f"rgba(34,124,128,{alpha})"
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+
+    group_values: dict[str, np.ndarray] = {}
+    for group in order:
+        vals = counties.loc[counties["rucc_group"] == group, "mobility_5yr_avg"].dropna().to_numpy(dtype=float)
+        if len(vals):
+            group_values[group] = vals
+
+    if not group_values:
+        fig = go.Figure()
+        fig.add_annotation(text="No valid mobility values available.", showarrow=False, x=0.5, y=0.5)
+        return plot_layout(fig, height=520)
+
+    all_values = np.concatenate(list(group_values.values()))
+    x_lo = float(np.quantile(all_values, 0.01))
+    x_hi = float(np.quantile(all_values, 0.99))
+    if x_hi <= x_lo:
+        x_lo = float(all_values.min())
+        x_hi = float(all_values.max())
+    pad = max(2.5, 0.08 * (x_hi - x_lo))
+    grid = np.linspace(x_lo - pad, x_hi + pad, 320)
+
+    ridge_height = 0.82
+    fig = go.Figure()
+
+    y_positions = {group: float(len(order) - idx - 1) for idx, group in enumerate(order)}
+    for group in order:
+        if group not in group_values:
+            continue
+        vals = group_values[group]
+        y_base = y_positions[group]
+        median_val = float(np.median(vals))
+        color = COLORS["teal"] if median_val >= 0 else COLORS["red"]
+
+        bandwidth = max(1.6, min(4.0, float(np.std(vals, ddof=0) * 0.35)))
+        kde = KernelDensity(kernel="gaussian", bandwidth=bandwidth)
+        kde.fit(vals.reshape(-1, 1))
+        density = np.exp(kde.score_samples(grid.reshape(-1, 1)))
+        max_density = float(density.max())
+        if max_density <= 0:
+            continue
+        density_scaled = density / max_density * ridge_height
+
+        x_poly = np.concatenate([grid, grid[::-1]])
+        y_poly = np.concatenate([y_base + density_scaled, np.full_like(grid, y_base)])
+        fig.add_trace(
+            go.Scatter(
+                x=x_poly,
+                y=y_poly,
+                mode="lines",
+                line=dict(color=color, width=1.2),
+                fill="toself",
+                fillcolor=to_rgba(color, 0.34),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=grid,
+                y=y_base + density_scaled,
+                mode="lines",
+                line=dict(color=color, width=2.0),
+                hovertemplate=(
+                    f"<b>{group} (n={len(vals):,})</b><br>"
+                    "Mobility: %{x:+.1f}<extra></extra>"
+                ),
+                showlegend=False,
+            )
+        )
+
+    for group in order:
+        if group not in group_values:
+            continue
+        y_base = y_positions[group]
+        fig.add_shape(
+            type="line",
+            x0=float(grid.min()),
+            x1=float(grid.max()),
+            y0=y_base,
+            y1=y_base,
+            line=dict(color="rgba(23,23,23,0.18)", width=1),
+            layer="below",
+        )
+
+    covered = int(counties["county_fips"].nunique())
+    max_group = int(max(len(v) for v in group_values.values()))
+
+    tickvals = [y_positions[g] for g in order if g in group_values]
+    ticktext = [f"{g} (n={len(group_values[g]):,})" for g in order if g in group_values]
+
     fig.update_layout(
-        title="Metro scale sets the stage for breakouts",
-        margin=dict(l=220, r=34, t=84, b=96),
-        uniformtext_minsize=10,
-        uniformtext_mode="hide",
+        title="County breakout density by metro/nonmetro setting",
+        margin=dict(l=240, r=34, t=84, b=108),
     )
-    fig.update_xaxes(title="Population-weighted mobility (income-index change)")
-    fig.update_yaxes(title="", autorange="reversed")
+    fig.update_xaxes(title="County breakout mobility (income-index change)")
+    fig.update_yaxes(
+        title="",
+        tickmode="array",
+        tickvals=tickvals,
+        ticktext=ticktext,
+        range=[-0.35, len(order) - 0.1],
+        showgrid=False,
+        zeroline=False,
+    )
+    note = (
+        "Ridgeline density view: each profile is a smoothed county distribution and points upward from its baseline. "
+        f"Coverage: {covered:,} counties; largest group has {max_group:,} counties."
+    )
+    if removed_outliers > 0:
+        note += f" Trimmed {removed_outliers} extreme county outlier(s) where only 1-2 points stretched a group's scale."
     fig.add_annotation(
         x=0.02,
-        y=-0.2,
+        y=-0.22,
         xref="paper",
         yref="paper",
-        text="Bar labels show how many of the top-100 mobility counties fall in each setting. Source: USDA ERS 2023 RUCC + BEA county personal income.",
+        text=note,
         showarrow=False,
         font=dict(size=12, color=COLORS["muted"]),
         align="left",
     )
-    return plot_layout(fig, height=560)
+    return plot_layout(fig, height=760)
 
 
 def industry_composition_lens() -> go.Figure:
@@ -1696,7 +1962,16 @@ def industry_composition_lens() -> go.Figure:
             showlegend=False,
         )
     )
-    fig.add_vline(x=0, line_color=COLORS["ink"], line_width=1, line_dash="dot")
+    fig.add_shape(
+        type="line",
+        x0=0,
+        x1=0,
+        y0=0,
+        y1=1,
+        xref="x1",
+        yref="paper",
+        line=dict(color=COLORS["ink"], width=1, dash="dot"),
+    )
     fig.update_layout(
         title="The breakout pattern has a clear industry signature",
         margin=dict(l=196, r=34, t=84, b=96),
@@ -1715,7 +1990,222 @@ def industry_composition_lens() -> go.Figure:
         font=dict(size=12, color=COLORS["muted"]),
         align="left",
     )
-    return plot_layout(fig, height=560)
+    return plot_layout(fig, height=700)
+
+
+def county_quality_of_life_lens() -> go.Figure:
+    path = CLEAN / "county_quality_of_life_index.csv"
+    if not path.exists():
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Run Dashboard/build_story_dashboard.py to generate county quality-of-life metrics.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=520)
+
+    df = pd.read_csv(path, dtype={"county_fips": str})
+    df = df.dropna(subset=["qol_score_0_100"]).copy()
+    if df.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Quality-of-life data is not available for this build.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=520)
+
+    # Prefer larger counties for readability, then fill if needed.
+    display_pool = df[df["acs_population"] >= 50_000].copy()
+    if len(display_pool) < 20:
+        display_pool = df.copy()
+    top = display_pool.nlargest(10, "qol_score_0_100").copy()
+    bottom = display_pool.nsmallest(10, "qol_score_0_100").copy()
+    display = pd.concat([bottom, top], ignore_index=True)
+    display["label"] = display["bea_county_name"] + " (" + display["state_name"] + ")"
+    display = display.sort_values("qol_score_0_100")
+
+    fig = go.Figure(
+        go.Bar(
+            x=display["qol_score_0_100"],
+            y=display["label"],
+            orientation="h",
+            marker=dict(
+                color=display["qol_score_0_100"],
+                colorscale=[[0.0, COLORS["red"]], [0.5, COLORS["gold"]], [1.0, COLORS["teal"]]],
+                cmin=0,
+                cmax=100,
+                line=dict(color="#ffffff", width=0.7),
+            ),
+            text=[f"{v:.1f}" for v in display["qol_score_0_100"]],
+            textposition="outside",
+            customdata=np.stack(
+                [
+                    display["acs_population"],
+                    display["qol_tier"],
+                    display["qol_components_used"],
+                ],
+                axis=-1,
+            ),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Quality-of-life score: %{x:.1f} / 100<br>"
+                "Tier: %{customdata[1]}<br>"
+                "Population: %{customdata[0]:,.0f}<br>"
+                "Components used: %{customdata[2]:.0f}<extra></extra>"
+            ),
+            showlegend=False,
+        )
+    )
+    fig.update_layout(
+        title="County quality-of-life index (composite, 2023)",
+        margin=dict(l=260, r=34, t=84, b=98),
+        uniformtext_minsize=10,
+        uniformtext_mode="hide",
+    )
+    fig.update_xaxes(title="Quality-of-life score (county percentile, 0-100)", range=[0, 100])
+    fig.update_yaxes(title="")
+    fig.add_annotation(
+        x=0.02,
+        y=-0.2,
+        xref="paper",
+        yref="paper",
+        text=(
+            "Composite index uses income, poverty, education, and county GDP per person; "
+            "where available it also includes broadband, unemployment, commute time, and remote-work share."
+        ),
+        showarrow=False,
+        font=dict(size=12, color=COLORS["muted"]),
+        align="left",
+    )
+    return plot_layout(fig, height=640)
+
+
+def qol_breakout_correlation_lens() -> go.Figure:
+    qol_path = CLEAN / "county_quality_of_life_index.csv"
+    mobility_path = CLEAN / "county_mobility_ml_dataset.csv"
+    if not qol_path.exists() or not mobility_path.exists():
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Run Dashboard/build_story_dashboard.py and Dashboard/analyze_county_mobility.py to generate QoL-breakout correlation inputs.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=520)
+
+    qol = pd.read_csv(qol_path, dtype={"county_fips": str})
+    mobility = pd.read_csv(
+        mobility_path,
+        dtype={"county_fips": str},
+        usecols=[
+            "county_fips",
+            "bea_county_name",
+            "state_name",
+            "mobility_5yr_avg",
+            "population_2024",
+            "income_index_1969_1973",
+            "income_index_2020_2024",
+        ],
+    )
+    df = mobility.merge(
+        qol[["county_fips", "qol_score_0_100", "qol_tier", "qol_components_used"]],
+        on="county_fips",
+        how="inner",
+    )
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["mobility_5yr_avg", "qol_score_0_100", "population_2024"]
+    )
+    if len(df) < 30:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Not enough joined county records to estimate QoL-breakout correlation.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=520)
+
+    pearson_r = df["qol_score_0_100"].corr(df["mobility_5yr_avg"])
+    spearman_rho = df["qol_score_0_100"].corr(df["mobility_5yr_avg"], method="spearman")
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scattergl(
+            x=df["qol_score_0_100"],
+            y=df["mobility_5yr_avg"],
+            mode="markers",
+            marker=dict(
+                size=np.clip(np.sqrt(df["population_2024"]) / 82, 4, 21),
+                color=df["qol_score_0_100"],
+                colorscale=[[0.0, COLORS["red"]], [0.5, COLORS["gold"]], [1.0, COLORS["teal"]]],
+                cmin=0,
+                cmax=100,
+                opacity=0.7,
+                line=dict(width=0),
+                colorbar=dict(title="QoL score"),
+            ),
+            customdata=np.stack(
+                [
+                    df["bea_county_name"],
+                    df["state_name"],
+                    df["population_2024"],
+                    df["qol_tier"],
+                    df["qol_components_used"],
+                    df["income_index_1969_1973"],
+                    df["income_index_2020_2024"],
+                ],
+                axis=-1,
+            ),
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "%{customdata[1]}<br>"
+                "QoL score: %{x:.1f} / 100<br>"
+                "Breakout mobility: %{y:+.1f}<br>"
+                "Tier: %{customdata[3]}<br>"
+                "Components used: %{customdata[4]:.0f}<br>"
+                "Income index: %{customdata[5]:.1f} to %{customdata[6]:.1f}<br>"
+                "Population: %{customdata[2]:,.0f}<extra></extra>"
+            ),
+            name="Counties",
+        )
+    )
+    add_ols_line(fig, df, "qol_score_0_100", "mobility_5yr_avg", "OLS fit")
+    fig.add_hline(y=0, line_color=COLORS["ink"], line_width=1, line_dash="dot")
+    fig.update_layout(
+        title="How strongly is county quality of life correlated with breakout?",
+        showlegend=False,
+    )
+    fig.update_xaxes(title="County quality-of-life score (0-100 percentile)")
+    fig.update_yaxes(title="Breakout mobility (income-index change)")
+    fig.add_annotation(
+        x=0.02,
+        y=0.98,
+        xref="paper",
+        yref="paper",
+        xanchor="left",
+        yanchor="top",
+        text=f"Pearson r = {pearson_r:+.2f}<br>Spearman rho = {spearman_rho:+.2f}",
+        showarrow=False,
+        bgcolor="rgba(255,255,255,0.86)",
+        bordercolor=COLORS["grid"],
+        borderpad=6,
+        font=dict(size=12, color=COLORS["ink"]),
+        align="left",
+    )
+    fig.add_annotation(
+        x=0.02,
+        y=-0.18,
+        xref="paper",
+        yref="paper",
+        text="Each point is a county in the mobility model sample. Marker size tracks population; line is an OLS fit.",
+        showarrow=False,
+        font=dict(size=12, color=COLORS["muted"]),
+        align="left",
+    )
+    return plot_layout(fig, height=620)
 
 
 def state_human_capital_scatter(latest: pd.DataFrame) -> go.Figure:
@@ -1988,118 +2478,722 @@ def education_income_diagnostics() -> go.Figure:
 
 
 def model_diagnostics() -> go.Figure:
-    residual_path = CLEAN / "county_mobility_residuals.csv"
-    importance_path = CLEAN / "county_mobility_feature_importance.csv"
-    if not residual_path.exists() or not importance_path.exists():
+    ml_path = CLEAN / "county_mobility_ml_dataset.csv"
+    if not ml_path.exists():
         fig = go.Figure()
         fig.add_annotation(
-            text="Run Dashboard/analyze_county_mobility.py to generate model diagnostics.",
+            text="Run Dashboard/analyze_county_mobility.py to generate county model inputs.",
             showarrow=False,
             x=0.5,
             y=0.5,
         )
         return plot_layout(fig, height=420)
 
-    residuals = pd.read_csv(residual_path)
-    importance = pd.read_csv(importance_path).head(10).sort_values("importance_mae_reduction")
-    df = residuals.copy()
-    labels = set(df.nlargest(8, "residual_mobility")["bea_county_name"])
-    labels |= set(df.nsmallest(8, "residual_mobility")["bea_county_name"])
+    df = pd.read_csv(ml_path)
+    feature_cols = [
+        "income_index_1969_1973",
+        "bachelors_or_higher_pct",
+        "unemployment_pct",
+        "median_household_income",
+        "poverty_pct",
+        "county_gdp_per_capita",
+        "broadband_pct",
+        "mean_commute_minutes",
+        "management_science_arts_occupation_pct",
+        "worked_from_home_pct",
+    ]
+    model_df = df[["mobility_5yr_avg", *feature_cols]].replace([np.inf, -np.inf], np.nan).dropna().copy()
+    model_df["breakout_up"] = (model_df["mobility_5yr_avg"] > 0).astype(int)
+    if len(model_df) < 120:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Not enough complete rows to estimate a logistic model.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=420)
+
+    X = model_df[feature_cols].copy()
+    y = model_df["breakout_up"].copy()
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=42, stratify=y
+    )
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+
+    model = LogisticRegressionCV(
+        Cs=np.logspace(-2, 2, 16),
+        cv=5,
+        penalty="l1",
+        solver="saga",
+        scoring="roc_auc",
+        max_iter=6000,
+        n_jobs=-1,
+        random_state=42,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        model.fit(X_train_s, y_train)
+    probs = model.predict_proba(X_test_s)[:, 1]
+    preds = (probs >= 0.5).astype(int)
+    auc = roc_auc_score(y_test, probs)
+    acc = accuracy_score(y_test, preds)
+    base_rate = y.mean()
+
+    def pretty_feature(name: str) -> str:
+        return (
+            name.replace("_pct", " share")
+            .replace("county_gdp_per_capita", "county GDP per capita")
+            .replace("_", " ")
+            .title()
+        )
+
+    coef = pd.Series(model.coef_.ravel(), index=feature_cols)
+    kept = coef[np.abs(coef) > 1e-5].copy()
+    if kept.empty:
+        kept = coef.abs().sort_values(ascending=False).head(6)
+        kept = coef.loc[kept.index]
+    kept = kept.sort_values()
+    coef_df = pd.DataFrame(
+        {
+            "feature": kept.index,
+            "feature_label": [pretty_feature(c) for c in kept.index],
+            "coef": kept.values,
+            "odds_ratio": np.exp(kept.values),
+        }
+    )
+
+    calib = pd.DataFrame({"pred_prob": probs, "actual": y_test.values})
+    calib["bin"] = pd.qcut(calib["pred_prob"], q=8, duplicates="drop")
+    calib = (
+        calib.groupby("bin", observed=True, as_index=False)
+        .agg(
+            mean_pred_prob=("pred_prob", "mean"),
+            actual_rate=("actual", "mean"),
+            count=("actual", "size"),
+        )
+        .sort_values("mean_pred_prob")
+    )
 
     fig = make_subplots(
         rows=1,
         cols=2,
-        column_widths=[0.58, 0.42],
-        horizontal_spacing=0.16,
+        column_widths=[0.5, 0.5],
+        horizontal_spacing=0.12,
         subplot_titles=(
-            "Random Forest predictions vs. actual mobility",
-            "Permutation importance",
+            "Logistic calibration: predicted vs observed breakout rate",
+            "Kept predictors (L1 logistic odds ratios)",
         ),
     )
     fig.add_trace(
-        go.Scatter(
-            x=df["predicted_mobility"],
-            y=df["mobility_5yr_avg"],
-            mode="markers+text",
-            text=[name if name in labels else "" for name in df["bea_county_name"]],
-            textposition="top center",
-            marker=dict(
-                size=np.clip(np.sqrt(df["population_2024"]) / 70, 5, 26),
-                color=df["residual_mobility"],
-                colorscale=[[0, COLORS["red"]], [0.5, "#eeeeee"], [1, COLORS["teal"]]],
-                cmin=-60,
-                cmax=60,
-                colorbar=dict(title="Residual"),
-                opacity=0.75,
-                line=dict(width=0),
-            ),
-            customdata=np.stack(
-                [
-                    df["bea_county_name"],
-                    df["state_name"],
-                    df["population_2024"],
-                    df["residual_mobility"],
-                    df["income_index_1969_1973"],
-                    df["income_index_2020_2024"],
-                ],
-                axis=-1,
-            ),
+        go.Bar(
+            x=calib["mean_pred_prob"] * 100,
+            y=calib["actual_rate"] * 100,
+            marker=dict(color=COLORS["teal"], line=dict(color="#ffffff", width=0.8)),
+            customdata=np.stack([calib["count"]], axis=-1),
             hovertemplate=(
-                "<b>%{customdata[0]}</b><br>"
-                "%{customdata[1]}<br>"
-                "Predicted mobility: %{x:.1f}<br>"
-                "Actual mobility: %{y:.1f}<br>"
-                "Residual: %{customdata[3]:+.1f}<br>"
-                "Index: %{customdata[4]:.1f} to %{customdata[5]:.1f}<br>"
-                "2024 population: %{customdata[2]:,.0f}<extra></extra>"
+                "Predicted breakout probability: %{x:.1f}%<br>"
+                "Observed breakout rate: %{y:.1f}%<br>"
+                "Counties in bin: %{customdata[0]:.0f}<extra></extra>"
             ),
-            name="Counties",
+            name="Observed",
+            showlegend=False,
         ),
         row=1,
         col=1,
     )
-    lim = [
-        min(df["predicted_mobility"].min(), df["mobility_5yr_avg"].min()) - 5,
-        max(df["predicted_mobility"].max(), df["mobility_5yr_avg"].max()) + 5,
-    ]
     fig.add_trace(
         go.Scatter(
-            x=lim,
-            y=lim,
-            mode="lines",
+            x=calib["mean_pred_prob"] * 100,
+            y=calib["mean_pred_prob"] * 100,
+            mode="lines+markers",
             line=dict(color=COLORS["ink"], width=2, dash="dot"),
+            marker=dict(size=6),
             hoverinfo="skip",
             showlegend=False,
         ),
         row=1,
         col=1,
     )
+
     fig.add_trace(
         go.Bar(
-            x=importance["importance_mae_reduction"],
-            y=[
-                name.replace("_pct", "").replace("_", " ")
-                for name in importance["feature"]
-            ],
+            x=coef_df["odds_ratio"],
+            y=coef_df["feature_label"],
             orientation="h",
-            marker_color=COLORS["teal"],
-            hovertemplate="%{y}<br>MAE reduction: %{x:.2f}<extra></extra>",
+            marker=dict(
+                color=[COLORS["teal"] if c > 0 else COLORS["red"] for c in coef_df["coef"]],
+                line=dict(color="#ffffff", width=0.8),
+            ),
+            customdata=np.stack([coef_df["coef"]], axis=-1),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Odds ratio (1 SD increase): %{x:.2f}<br>"
+                "Coefficient: %{customdata[0]:+.2f}<extra></extra>"
+            ),
             showlegend=False,
         ),
         row=1,
         col=2,
     )
+    fig.add_vline(x=1, line_color=COLORS["ink"], line_width=1, line_dash="dot", row=1, col=2)
+
     fig.update_layout(
-        title="The model explains some mobility, but the residuals are the interesting counties",
+        title="Simple breakout model: multivariable logistic regression (L1-pruned)",
         showlegend=False,
     )
-    fig.update_xaxes(title="Predicted mobility index change", range=lim, row=1, col=1)
-    fig.update_yaxes(title="Actual mobility index change", range=lim, row=1, col=1)
-    fig.update_xaxes(title="Increase in absolute error when shuffled", row=1, col=2)
+    fig.update_xaxes(title="Predicted breakout probability (%)", row=1, col=1)
+    fig.update_yaxes(title="Observed breakout rate (%)", row=1, col=1)
+    fig.update_xaxes(title="Odds ratio for moving up", row=1, col=2)
     fig.update_yaxes(title="", automargin=True, row=1, col=2)
-    fig = plot_layout(fig, height=650)
-    fig.update_layout(margin=dict(l=76, r=34, t=88, b=76))
+    fig = plot_layout(fig, height=620)
+    fig.update_layout(margin=dict(l=90, r=34, t=96, b=80))
+    fig.add_annotation(
+        x=0.01,
+        y=1.08,
+        xref="paper",
+        yref="paper",
+        xanchor="left",
+        yanchor="top",
+        text=(
+            f"n={len(model_df):,} counties | baseline breakout rate={base_rate*100:.1f}% | "
+            f"AUC={auc:.2f} | accuracy={acc:.2f} | kept predictors={len(coef_df)}"
+        ),
+        showarrow=False,
+        font=dict(size=12, color=COLORS["muted"]),
+        align="left",
+    )
     return fig
+
+
+def kmeans_cluster_lens() -> go.Figure:
+    path = CLEAN / "county_mobility_cluster_summary.csv"
+    if not path.exists():
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Run Dashboard/analyze_county_mobility.py to generate K-means cluster summaries.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=420)
+
+    df = pd.read_csv(path).sort_values("avg_mobility")
+    fig = go.Figure(
+        go.Bar(
+            x=df["avg_mobility"],
+            y=df["cluster_label"],
+            orientation="h",
+            marker=dict(
+                color=df["avg_mobility"],
+                colorscale=[[0.0, COLORS["red"]], [0.5, COLORS["gold"]], [1.0, COLORS["teal"]]],
+                line=dict(color="#ffffff", width=0.8),
+            ),
+            text=[f"{int(c)} counties" for c in df["counties"]],
+            textposition="outside",
+            customdata=np.stack(
+                [
+                    df["avg_bachelors"],
+                    df["avg_poverty"],
+                    df["avg_population_growth"],
+                ],
+                axis=-1,
+            ),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Average breakout mobility: %{x:+.1f}<br>"
+                "Avg bachelor's share: %{customdata[0]:.1f}%<br>"
+                "Avg poverty: %{customdata[1]:.1f}%<br>"
+                "Avg population growth: %{customdata[2]:+.1f}%<extra></extra>"
+            ),
+            showlegend=False,
+        )
+    )
+    fig.add_shape(
+        type="line",
+        x0=0,
+        x1=0,
+        y0=0,
+        y1=1,
+        xref="x",
+        yref="paper",
+        line=dict(color=COLORS["ink"], width=1, dash="dot"),
+    )
+    fig.update_layout(
+        title="K-means county clusters: which county types are moving up?",
+        margin=dict(l=210, r=34, t=86, b=86),
+    )
+    fig.update_xaxes(title="Average breakout mobility (income-index change)")
+    fig.update_yaxes(title="")
+    fig.add_annotation(
+        x=0.02,
+        y=-0.19,
+        xref="paper",
+        yref="paper",
+        text="Cluster labels summarize county archetypes in the filtered modeling sample.",
+        showarrow=False,
+        font=dict(size=12, color=COLORS["muted"]),
+        align="left",
+    )
+    return plot_layout(fig, height=520)
+
+
+def kmeans_cluster_map() -> go.Figure:
+    cluster_path = CLEAN / "county_mobility_clusters.csv"
+    geojson_path = RAW / "geojson-counties-fips.json"
+    if not cluster_path.exists() or not geojson_path.exists():
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Run Dashboard/analyze_county_mobility.py and ensure county GeoJSON is available.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=520)
+
+    df = pd.read_csv(cluster_path, dtype={"county_fips": str})
+    df = df.dropna(subset=["cluster", "cluster_label"]).copy()
+    if df.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No county clusters available to map.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=520)
+
+    df["county_fips"] = df["county_fips"].str.zfill(5)
+    order = (
+        df.groupby(["cluster", "cluster_label"], as_index=False)["mobility_5yr_avg"]
+        .mean()
+        .sort_values("mobility_5yr_avg", ascending=False)
+    )
+    labels = order["cluster_label"].tolist()
+    label_to_index = {label: idx for idx, label in enumerate(labels)}
+    df["cluster_idx"] = df["cluster_label"].map(label_to_index)
+
+    with geojson_path.open() as f:
+        full_geojson = json.load(f)
+    selected_fips = set(df["county_fips"])
+    filtered_geojson = {
+        "type": "FeatureCollection",
+        "features": [feature for feature in full_geojson["features"] if feature["id"] in selected_fips],
+    }
+
+    palette = [COLORS["teal"], COLORS["blue"], COLORS["gold"], "#8a6b5c", COLORS["red"]]
+    n = max(len(labels), 1)
+    colorscale = []
+    for i in range(n):
+        c = palette[i % len(palette)]
+        v = i / (n - 1) if n > 1 else 0
+        colorscale.append([v, c])
+
+    fig = go.Figure(
+        go.Choroplethmapbox(
+            geojson=filtered_geojson,
+            locations=df["county_fips"],
+            z=df["cluster_idx"],
+            zmin=0,
+            zmax=max(n - 1, 0),
+            colorscale=colorscale,
+            marker_line_width=0.2,
+            marker_line_color="rgba(255,255,255,0.45)",
+            customdata=np.stack(
+                [
+                    df["bea_county_name"],
+                    df["state_name"],
+                    df["cluster_label"],
+                    df["mobility_5yr_avg"],
+                ],
+                axis=-1,
+            ),
+            hovertemplate=(
+                "<b>%{customdata[0]}, %{customdata[1]}</b><br>"
+                "Cluster: %{customdata[2]}<br>"
+                "Breakout mobility: %{customdata[3]:+.1f}<extra></extra>"
+            ),
+            colorbar=dict(
+                title="Cluster type",
+                tickvals=list(range(n)),
+                ticktext=labels,
+                len=0.72,
+                thickness=16,
+                x=1.02,
+            ),
+        )
+    )
+    fig.update_layout(
+        title="K-means county clusters on the map",
+        margin=dict(l=18, r=90, t=88, b=48),
+        mapbox=dict(
+            style="carto-positron",
+            center=dict(lat=37.8, lon=-96.4),
+            zoom=2.7,
+        ),
+    )
+    coverage_base = pd.read_csv(CLEAN / "county_income_breakouts_1969_2024.csv", dtype={"county_fips": str})
+    coverage_pct = len(df) / max(len(coverage_base), 1) * 100
+    fig.add_annotation(
+        x=0.01,
+        y=-0.12,
+        xref="paper",
+        yref="paper",
+        text=f"Map covers {len(df):,} counties ({coverage_pct:.1f}% of counties in the BEA income panel).",
+        showarrow=False,
+        font=dict(size=12, color=COLORS["muted"]),
+        align="left",
+    )
+    return plot_layout(fig, height=700)
+
+
+def kmeans_k_diagnostic() -> go.Figure:
+    cluster_path = CLEAN / "county_mobility_clusters.csv"
+    if not cluster_path.exists():
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Run Dashboard/analyze_county_mobility.py to generate county clusters first.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=460)
+
+    df = pd.read_csv(cluster_path)
+    features = [
+        "income_index_1969_1973",
+        "mobility_5yr_avg",
+        "population_growth_pct",
+        "bachelors_or_higher_pct",
+        "median_household_income",
+        "county_gdp_per_capita",
+        "poverty_pct",
+    ]
+    model_df = df.dropna(subset=features).copy()
+    if len(model_df) < 50:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Not enough county rows to evaluate candidate K values.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=460)
+
+    for col in features:
+        lo, hi = model_df[col].quantile([0.01, 0.99])
+        model_df[col] = model_df[col].clip(lo, hi)
+    x = StandardScaler().fit_transform(model_df[features])
+    k_values = list(range(2, 11))
+    inertia = []
+    silhouette = []
+    for k in k_values:
+        km = KMeans(n_clusters=k, random_state=42, n_init=30)
+        labels = km.fit_predict(x)
+        inertia.append(km.inertia_)
+        silhouette.append(silhouette_score(x, labels))
+
+    silhouette_arr = np.array(silhouette)
+    best_k = k_values[int(np.argmax(silhouette_arr))]
+    current_k = 3
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Scatter(
+            x=k_values,
+            y=inertia,
+            mode="lines+markers",
+            line=dict(color=COLORS["blue"], width=3),
+            marker=dict(size=8),
+            name="Inertia (lower is better)",
+            hovertemplate="K=%{x}<br>Inertia=%{y:,.0f}<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=k_values,
+            y=silhouette,
+            mode="lines+markers",
+            line=dict(color=COLORS["teal"], width=3),
+            marker=dict(size=8),
+            name="Silhouette (higher is better)",
+            hovertemplate="K=%{x}<br>Silhouette=%{y:.3f}<extra></extra>",
+        ),
+        secondary_y=True,
+    )
+    fig.add_vline(x=current_k, line_dash="dot", line_color=COLORS["ink"], line_width=1)
+    fig.add_annotation(
+        x=current_k,
+        y=max(inertia),
+        xref="x",
+        yref="y",
+        text=f"Current K={current_k}",
+        showarrow=True,
+        arrowhead=2,
+        ax=30,
+        ay=-30,
+        bgcolor="rgba(255,255,255,0.85)",
+    )
+    fig.update_layout(
+        title="Is K=3 reasonable? Elbow + silhouette check",
+        margin=dict(l=64, r=68, t=88, b=70),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+    )
+    fig.update_xaxes(title="Number of clusters (K)", tickmode="linear", dtick=1)
+    fig.update_yaxes(title="Inertia", secondary_y=False)
+    fig.update_yaxes(title="Silhouette score", secondary_y=True, range=[0, max(0.4, silhouette_arr.max() + 0.04)])
+    fig.add_annotation(
+        x=0.01,
+        y=-0.23,
+        xref="paper",
+        yref="paper",
+        text=f"Best silhouette in tested range is K={best_k}. Use this as guidance, not proof.",
+        showarrow=False,
+        font=dict(size=12, color=COLORS["muted"]),
+        align="left",
+    )
+    return plot_layout(fig, height=470)
+
+
+def cluster_model_check() -> go.Figure:
+    cluster_path = CLEAN / "county_mobility_clusters.csv"
+    if not cluster_path.exists():
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Run Dashboard/analyze_county_mobility.py to generate county clusters first.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=360)
+
+    df = pd.read_csv(cluster_path)
+    features = [
+        "income_index_1969_1973",
+        "mobility_5yr_avg",
+        "population_growth_pct",
+        "bachelors_or_higher_pct",
+        "median_household_income",
+        "county_gdp_per_capita",
+        "poverty_pct",
+    ]
+    model_df = df.dropna(subset=features).copy()
+    if len(model_df) < 50:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Not enough county rows to compare clustering models.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=360)
+
+    for col in features:
+        lo, hi = model_df[col].quantile([0.01, 0.99])
+        model_df[col] = model_df[col].clip(lo, hi)
+    x = StandardScaler().fit_transform(model_df[features])
+    k = 3
+
+    rows = []
+    km = KMeans(n_clusters=k, random_state=42, n_init=30)
+    km_labels = km.fit_predict(x)
+    km_sizes = pd.Series(km_labels).value_counts(normalize=True)
+    rows.append(
+        {
+            "model": "KMeans",
+            "silhouette": silhouette_score(x, km_labels),
+            "bic": np.nan,
+            "aic": np.nan,
+            "min_cluster_share": km_sizes.min(),
+        }
+    )
+
+    for cov in ["full", "diag", "tied", "spherical"]:
+        gmm = GaussianMixture(n_components=k, covariance_type=cov, random_state=42, n_init=5)
+        gmm.fit(x)
+        labels = gmm.predict(x)
+        sizes = pd.Series(labels).value_counts(normalize=True)
+        rows.append(
+            {
+                "model": f"GMM ({cov})",
+                "silhouette": silhouette_score(x, labels),
+                "bic": gmm.bic(x),
+                "aic": gmm.aic(x),
+                "min_cluster_share": sizes.min(),
+            }
+        )
+
+    result = pd.DataFrame(rows).sort_values("silhouette", ascending=False).reset_index(drop=True)
+
+    fig = go.Figure(
+        go.Bar(
+            x=result["silhouette"],
+            y=result["model"],
+            orientation="h",
+            marker=dict(
+                color=result["silhouette"],
+                colorscale=[[0.0, COLORS["red"]], [0.5, COLORS["gold"]], [1.0, COLORS["teal"]]],
+                line=dict(color="#ffffff", width=0.8),
+            ),
+            customdata=np.stack(
+                [
+                    result["min_cluster_share"] * 100,
+                    result["bic"].fillna(np.nan),
+                    result["aic"].fillna(np.nan),
+                ],
+                axis=-1,
+            ),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Silhouette: %{x:.3f}<br>"
+                "Smallest cluster: %{customdata[0]:.1f}%<br>"
+                "BIC: %{customdata[1]:,.0f}<br>"
+                "AIC: %{customdata[2]:,.0f}<extra></extra>"
+            ),
+            text=[f"{v:.3f}" for v in result["silhouette"]],
+            textposition="outside",
+            showlegend=False,
+        )
+    )
+    fig.update_layout(
+        title="K=3 model check: KMeans vs GMM variants",
+        margin=dict(l=170, r=24, t=78, b=66),
+    )
+    fig.update_xaxes(title="Silhouette (higher is better)")
+    fig.update_yaxes(title="")
+    best_row = result.iloc[0]
+    fig.add_annotation(
+        x=0.01,
+        y=-0.16,
+        xref="paper",
+        yref="paper",
+        text=(
+            f"Highest silhouette here: {best_row['model']} ({best_row['silhouette']:.3f}). "
+            "Also check smallest-cluster share to avoid collapsed/over-imbalanced partitions."
+        ),
+        showarrow=False,
+        font=dict(size=12, color=COLORS["muted"]),
+        align="left",
+    )
+    return plot_layout(fig, height=360)
+
+
+def gmm_tied_cluster_map() -> go.Figure:
+    base_path = CLEAN / "county_income_breakouts_1969_2024.csv"
+    story_path = CLEAN / "county_story_2023.csv"
+    geojson_path = RAW / "geojson-counties-fips.json"
+    if not base_path.exists() or not story_path.exists() or not geojson_path.exists():
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Missing files for GMM visualization. Rebuild clean data and county GeoJSON.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=700)
+
+    base = pd.read_csv(base_path, dtype={"county_fips": str}).rename(
+        columns={
+            "income_index_start": "income_index_1969_1973",
+            "income_index_change": "mobility_5yr_avg",
+            "population_change_pct": "population_growth_pct",
+        }
+    )
+    story = pd.read_csv(story_path, dtype={"county_fips": str})
+    df = base.merge(
+        story[
+            [
+                "county_fips",
+                "bea_county_name",
+                "state_name",
+                "bachelors_or_higher_pct",
+                "median_household_income",
+                "poverty_pct",
+                "county_gdp_per_capita",
+            ]
+        ],
+        on=["county_fips", "bea_county_name", "state_name"],
+        how="left",
+    )
+    features = [
+        "income_index_1969_1973",
+        "mobility_5yr_avg",
+        "population_growth_pct",
+        "bachelors_or_higher_pct",
+        "median_household_income",
+        "county_gdp_per_capita",
+        "poverty_pct",
+    ]
+    df = df.dropna(subset=features).copy()
+    if df.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No rows available for GMM map.", showarrow=False, x=0.5, y=0.5)
+        return plot_layout(fig, height=700)
+    for col in features:
+        lo, hi = df[col].quantile([0.01, 0.99])
+        df[col] = df[col].clip(lo, hi)
+
+    x = StandardScaler().fit_transform(df[features])
+    gmm = GaussianMixture(n_components=3, covariance_type="tied", random_state=42, n_init=5)
+    df["cluster"] = gmm.fit_predict(x)
+    label_order = (
+        df.groupby("cluster", as_index=False)["mobility_5yr_avg"].mean().sort_values("mobility_5yr_avg")
+    )
+    labels = ["lower breakout", "middle breakout", "higher breakout"]
+    mapping = {row.cluster: labels[i] for i, row in enumerate(label_order.itertuples(index=False))}
+    df["cluster_label"] = df["cluster"].map(mapping)
+    idx_map = {label: i for i, label in enumerate(labels)}
+    df["cluster_idx"] = df["cluster_label"].map(idx_map)
+
+    with geojson_path.open() as f:
+        full_geojson = json.load(f)
+    selected = set(df["county_fips"])
+    filtered_geojson = {
+        "type": "FeatureCollection",
+        "features": [feat for feat in full_geojson["features"] if feat["id"] in selected],
+    }
+
+    fig = go.Figure(
+        go.Choroplethmapbox(
+            geojson=filtered_geojson,
+            locations=df["county_fips"],
+            z=df["cluster_idx"],
+            zmin=0,
+            zmax=2,
+            colorscale=[[0.0, COLORS["red"]], [0.5, COLORS["gold"]], [1.0, COLORS["teal"]]],
+            marker_line_width=0.2,
+            marker_line_color="rgba(255,255,255,0.45)",
+            customdata=np.stack(
+                [df["bea_county_name"], df["state_name"], df["cluster_label"], df["mobility_5yr_avg"]],
+                axis=-1,
+            ),
+            hovertemplate=(
+                "<b>%{customdata[0]}, %{customdata[1]}</b><br>"
+                "GMM tied cluster: %{customdata[2]}<br>"
+                "Breakout mobility: %{customdata[3]:+.1f}<extra></extra>"
+            ),
+            colorbar=dict(title="GMM tied", tickvals=[0, 1, 2], ticktext=labels, len=0.72, thickness=16, x=1.02),
+        )
+    )
+    fig.update_layout(
+        title="GMM (tied covariance) county clusters on the map",
+        margin=dict(l=18, r=90, t=88, b=48),
+        mapbox=dict(style="carto-positron", center=dict(lat=37.8, lon=-96.4), zoom=2.7),
+    )
+    fig.add_annotation(
+        x=0.01,
+        y=-0.12,
+        xref="paper",
+        yref="paper",
+        text=f"GMM tied, K=3, coverage: {len(df):,} counties.",
+        showarrow=False,
+        font=dict(size=12, color=COLORS["muted"]),
+        align="left",
+    )
+    return plot_layout(fig, height=700)
 
 
 def county_scatter(county: pd.DataFrame) -> go.Figure:
@@ -2200,7 +3294,7 @@ def top_bottom_lollipop(latest: pd.DataFrame) -> go.Figure:
     fig.update_layout(title="The tails tell the story most clearly")
     fig.update_xaxes(title="2023 real GDP per person", tickprefix="$", tickformat=",.0f")
     fig.update_yaxes(title="", categoryorder="array", categoryarray=df["state"].tolist())
-    return plot_layout(fig, height=560)
+    return plot_layout(fig, height=700)
 
 
 def time_paths(merged: pd.DataFrame, latest: pd.DataFrame) -> go.Figure:
@@ -2703,7 +3797,7 @@ def make_html(
         (
             "5",
             "What Factors Matter?",
-            "A descriptive Random Forest highlights which county traits carry the most signal for breakout outcomes.",
+            "A simple multivariable logistic model shows which county factors increase or reduce the odds of moving up.",
             model_diagnostics(),
         ),
         (
@@ -2725,6 +3819,48 @@ def make_html(
             "State Engines",
             "The best states are portfolios of county engines, not just one famous superstar county.",
             state_engine_breakdown(county, latest),
+        ),
+        (
+            "C",
+            "County Quality Of Life",
+            "A county-level quality-of-life composite makes it easier to benchmark local outcomes with one comparable score.",
+            county_quality_of_life_lens(),
+        ),
+        (
+            "D",
+            "QoL vs Breakout Correlation",
+            "This links the composite quality-of-life score directly to breakout mobility to show how tightly they move together.",
+            qol_breakout_correlation_lens(),
+        ),
+        (
+            "E",
+            "County Clusters (K-Means)",
+            "K-means groups counties into simple archetypes so you can see which county types are consistently moving up.",
+            kmeans_cluster_lens(),
+        ),
+        (
+            "F",
+            "Clusters On The Map",
+            "Same K-means archetypes, now mapped so we can see where each county type is concentrated.",
+            kmeans_cluster_map(),
+        ),
+        (
+            "G",
+            "Picking K",
+            "Quick elbow + silhouette diagnostics to sanity-check whether K=3 is a defensible cluster count.",
+            kmeans_k_diagnostic(),
+        ),
+        (
+            "H",
+            "KMeans vs GMM",
+            "Side-by-side metrics for K=3 so you can see whether Gaussian mixtures outperform standard K-means.",
+            cluster_model_check(),
+        ),
+        (
+            "I",
+            "GMM Tied Map",
+            "A direct map of GMM (tied covariance, K=3) clusters so you can compare geographic structure vs K-means.",
+            gmm_tied_cluster_map(),
         ),
     ]
     atlas_records = atlas_story_records()
@@ -2805,7 +3941,7 @@ def make_html(
     )
     support_sections = "\n".join(
         f"""
-        <section class="viz-block support-block" id="support-{num}">
+      <section class="viz-block support-block" id="support-block-{num}">
           <div class="section-kicker">Supporting Evidence {num}</div>
           <div class="section-head">
             <h2>{title}</h2>
@@ -3513,8 +4649,8 @@ def make_html(
         </div>
         <div class="metric">
           <div class="label">Model residuals</div>
-          <div class="value">R2 .59</div>
-          <div class="sub">Random Forest descriptive model</div>
+          <div class="value">Logit</div>
+          <div class="sub">L1 logistic breakout model + K-means county archetypes</div>
         </div>
       </div>
     </header>
@@ -3717,6 +4853,7 @@ def main() -> None:
         gdp_breakouts,
         county_income_panel,
         county_gdp_index,
+        county_qol,
     ) = enrich_data()
     html = make_html(
         merged,
@@ -3739,6 +4876,7 @@ def main() -> None:
     print(f"Wrote Clean Data/county_gdp_breakouts_2001_2024.csv ({len(gdp_breakouts):,} rows)")
     print(f"Wrote Clean Data/state_story_2023.csv ({len(latest):,} rows)")
     print(f"Wrote Clean Data/county_story_2023.csv ({len(county):,} rows)")
+    print(f"Wrote Clean Data/county_quality_of_life_index.csv ({len(county_qol):,} rows)")
 
 
 if __name__ == "__main__":
