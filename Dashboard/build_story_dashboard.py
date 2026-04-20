@@ -352,39 +352,45 @@ def county_concentration_metrics(county_panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def county_income_breakouts(
-    income_panel: pd.DataFrame, start_year: int = 1969, end_year: int = 2024
+    income_panel: pd.DataFrame,
+    start_window: tuple[int, int] = (1969, 1979),
+    end_window: tuple[int, int] = (2020, 2024),
 ) -> pd.DataFrame:
-    start = income_panel[income_panel["year"] == start_year][
-        [
-            "county_fips",
-            "bea_county_name",
-            "state_name",
-            "population",
-            "per_capita_personal_income",
-            "income_index_us_100",
-        ]
-    ].rename(
-        columns={
-            "population": "population_start",
-            "per_capita_personal_income": "pcpi_start",
-            "income_index_us_100": "income_index_start",
-        }
+    def _window_avg(panel: pd.DataFrame, y0: int, y1: int) -> pd.DataFrame:
+        w = panel[panel["year"].between(y0, y1)]
+        return (
+            w.groupby("county_fips")
+            .agg(income_index=("income_index_us_100", "mean"), pcpi=("per_capita_personal_income", "mean"))
+            .reset_index()
+        )
+
+    start_avg = _window_avg(income_panel, *start_window)
+    end_avg = _window_avg(income_panel, *end_window)
+
+    # Anchor metadata to the first year of each window
+    meta_start = income_panel[income_panel["year"] == start_window[0]][
+        ["county_fips", "bea_county_name", "state_name", "population"]
+    ].rename(columns={"population": "population_start"})
+    meta_end = income_panel[income_panel["year"] == end_window[1]][
+        ["county_fips", "population"]
+    ].rename(columns={"population": "population_end"})
+
+    start = meta_start.merge(start_avg, on="county_fips", how="inner").rename(
+        columns={"income_index": "income_index_start", "pcpi": "pcpi_start"}
     )
-    end = income_panel[income_panel["year"] == end_year][
-        [
-            "county_fips",
-            "population",
-            "per_capita_personal_income",
-            "income_index_us_100",
-        ]
-    ].rename(
-        columns={
-            "population": "population_end",
-            "per_capita_personal_income": "pcpi_end",
-            "income_index_us_100": "income_index_end",
-        }
+    end = end_avg.merge(meta_end, on="county_fips", how="inner").rename(
+        columns={"income_index": "income_index_end", "pcpi": "pcpi_end"}
     )
+
+    volatility = (
+        income_panel[income_panel["year"].between(start_window[0], end_window[1])]
+        .groupby("county_fips")["income_index_us_100"]
+        .std()
+        .rename("income_index_volatility")
+    )
+
     out = start.merge(end, on="county_fips", how="inner")
+    out = out.merge(volatility, on="county_fips", how="left")
     out = out.dropna(subset=["income_index_start", "income_index_end", "population_end"]).copy()
     out["income_index_change"] = out["income_index_end"] - out["income_index_start"]
     out["income_index_ratio"] = out["income_index_end"] / out["income_index_start"]
@@ -394,7 +400,9 @@ def county_income_breakouts(
     out["rank_start"] = out["income_index_start"].rank(ascending=False, method="min")
     out["rank_end"] = out["income_index_end"].rank(ascending=False, method="min")
     out["rank_gain"] = out["rank_start"] - out["rank_end"]
-    out["period"] = f"{start_year}-{end_year}"
+    out["period"] = f"{start_window[0]}-{start_window[1]} avg vs {end_window[0]}-{end_window[1]} avg"
+    vol_threshold = out["income_index_volatility"].quantile(0.75)
+    out["high_volatility"] = out["income_index_volatility"] > vol_threshold
     return out.sort_values("income_index_change", ascending=False)
 
 
@@ -929,18 +937,22 @@ def county_breakout_scatter(
                     income["rank_gain"],
                     income["pcpi_start"],
                     income["pcpi_end"],
+                    income["income_index_volatility"].round(1),
+                    income["high_volatility"].map({True: "⚠ High path volatility", False: ""}),
                 ],
                 axis=-1,
             ),
             hovertemplate=(
                 "<b>%{customdata[0]}</b><br>"
                 "%{customdata[1]}<br>"
-                "1969 income index: %{x:.1f}<br>"
-                "2024 income index: %{y:.1f}<br>"
+                "1969–79 avg income index: %{x:.1f}<br>"
+                "2020–24 avg income index: %{y:.1f}<br>"
                 "Index change: %{customdata[3]:+.1f}<br>"
                 "Rank gain: %{customdata[4]:+.0f}<br>"
                 "2024 population: %{customdata[2]:,.0f}<br>"
-                "PCPI: $%{customdata[5]:,.0f} to $%{customdata[6]:,.0f}<extra></extra>"
+                "PCPI: $%{customdata[5]:,.0f} to $%{customdata[6]:,.0f}<br>"
+                "Path volatility (σ): %{customdata[7]}<br>"
+                "%{customdata[8]}<extra></extra>"
             ),
             name="Income mobility",
             visible=True,
@@ -1030,11 +1042,11 @@ def county_breakout_scatter(
                             {"visible": [True, False, True, False]},
                             {
                                 "xaxis": {
-                                    "title": "1969 per-capita personal income index, U.S. = 100",
+                                    "title": "1969–79 avg per-capita personal income index, U.S. = 100",
                                     "range": [0, 300],
                                 },
                                 "yaxis": {
-                                    "title": "2024 per-capita personal income index, U.S. = 100",
+                                    "title": "2020–24 avg per-capita personal income index, U.S. = 100",
                                     "range": [0, 300],
                                 },
                             },
@@ -1061,8 +1073,8 @@ def county_breakout_scatter(
             )
         ],
     )
-    fig.update_xaxes(title="1969 per-capita personal income index, U.S. = 100", range=[0, 300])
-    fig.update_yaxes(title="2024 per-capita personal income index, U.S. = 100", range=[0, 300])
+    fig.update_xaxes(title="1969–79 avg per-capita personal income index, U.S. = 100", range=[0, 300])
+    fig.update_yaxes(title="2020–24 avg per-capita personal income index, U.S. = 100", range=[0, 300])
     return plot_layout(fig, height=640)
 
 
@@ -1070,22 +1082,29 @@ def county_mobility_animation(income_panel: pd.DataFrame) -> go.Figure:
     latest_pop = income_panel[income_panel["year"] == 2024][["county_fips", "population"]].rename(
         columns={"population": "population_2024"}
     )
-    baseline = income_panel[income_panel["year"] == 1969][
-        ["county_fips", "bea_county_name", "state_name", "income_index_us_100"]
-    ].rename(columns={"income_index_us_100": "baseline_index"})
+    baseline = (
+        income_panel[income_panel["year"].between(1969, 1979)]
+        .groupby("county_fips")["income_index_us_100"]
+        .mean()
+        .rename("baseline_index")
+        .reset_index()
+    )
+    meta = income_panel[income_panel["year"] == 1969][["county_fips", "bea_county_name", "state_name"]]
+    baseline = baseline.merge(meta, on="county_fips", how="left")
     panel = income_panel.merge(latest_pop, on="county_fips", how="left").merge(
         baseline, on=["county_fips", "bea_county_name", "state_name"], how="inner"
     )
     panel = panel[
         (panel["population_2024"] >= 75_000)
+        & (panel["year"] >= 1979)
         & panel["baseline_index"].notna()
         & panel["income_index_us_100"].notna()
     ].copy()
-    panel["index_change_since_1969"] = panel["income_index_us_100"] - panel["baseline_index"]
+    panel["index_change_since_baseline"] = panel["income_index_us_100"] - panel["baseline_index"]
 
     final = panel[panel["year"] == 2024].copy()
-    focus_counties = set(final.nlargest(8, "index_change_since_1969")["county_fips"])
-    focus_counties |= set(final.nsmallest(8, "index_change_since_1969")["county_fips"])
+    focus_counties = set(final.nlargest(8, "index_change_since_baseline")["county_fips"])
+    focus_counties |= set(final.nsmallest(8, "index_change_since_baseline")["county_fips"])
 
     def frame_data(year: int) -> pd.DataFrame:
         df = panel[panel["year"] == year].sort_values("county_fips").copy()
@@ -1096,7 +1115,7 @@ def county_mobility_animation(income_panel: pd.DataFrame) -> go.Figure:
         )
         return df
 
-    initial = frame_data(1969)
+    initial = frame_data(1979)
     fig = go.Figure()
     fig.add_trace(
         go.Scattergl(
@@ -1107,11 +1126,11 @@ def county_mobility_animation(income_panel: pd.DataFrame) -> go.Figure:
             textposition="top center",
             marker=dict(
                 size=np.clip(np.sqrt(initial["population_2024"]) / 62, 5, 30),
-                color=initial["index_change_since_1969"],
+                color=initial["index_change_since_baseline"],
                 colorscale=[[0, COLORS["red"]], [0.5, "#eeeeee"], [1, COLORS["teal"]]],
                 cmin=-80,
                 cmax=80,
-                colorbar=dict(title="Change vs. 1969"),
+                colorbar=dict(title="Change vs.\n1969–79 avg"),
                 opacity=0.74,
                 line=dict(width=0),
             ),
@@ -1120,7 +1139,7 @@ def county_mobility_animation(income_panel: pd.DataFrame) -> go.Figure:
                     initial["bea_county_name"],
                     initial["state_name"],
                     initial["population_2024"],
-                    initial["index_change_since_1969"],
+                    initial["index_change_since_baseline"],
                     initial["per_capita_personal_income"],
                     initial["year"],
                 ],
@@ -1129,9 +1148,9 @@ def county_mobility_animation(income_panel: pd.DataFrame) -> go.Figure:
             hovertemplate=(
                 "<b>%{customdata[0]}</b><br>"
                 "%{customdata[1]}<br>"
-                "1969 index: %{x:.1f}<br>"
+                "1969–79 avg index: %{x:.1f}<br>"
                 "%{customdata[5]:.0f} index: %{y:.1f}<br>"
-                "Change since 1969: %{customdata[3]:+.1f}<br>"
+                "Change since 1969–79 avg: %{customdata[3]:+.1f}<br>"
                 "Per-capita personal income: $%{customdata[4]:,.0f}<br>"
                 "2024 population: %{customdata[2]:,.0f}<extra></extra>"
             ),
@@ -1149,6 +1168,9 @@ def county_mobility_animation(income_panel: pd.DataFrame) -> go.Figure:
         )
     )
 
+    def y_title_for(year: int) -> str:
+        return f"{year} per-capita personal income index, U.S. = 100"
+
     frames = []
     for year in sorted(panel["year"].unique()):
         df = frame_data(int(year))
@@ -1162,14 +1184,14 @@ def county_mobility_animation(income_panel: pd.DataFrame) -> go.Figure:
                         text=df["label"],
                         marker=dict(
                             size=np.clip(np.sqrt(df["population_2024"]) / 62, 5, 30),
-                            color=df["index_change_since_1969"],
+                            color=df["index_change_since_baseline"],
                         ),
                         customdata=np.stack(
                             [
                                 df["bea_county_name"],
                                 df["state_name"],
                                 df["population_2024"],
-                                df["index_change_since_1969"],
+                                df["index_change_since_baseline"],
                                 df["per_capita_personal_income"],
                                 df["year"],
                             ],
@@ -1178,6 +1200,7 @@ def county_mobility_animation(income_panel: pd.DataFrame) -> go.Figure:
                     ),
                     go.Scatter(x=[0, 320], y=[0, 320]),
                 ],
+                layout=dict(yaxis=dict(title=dict(text=y_title_for(int(year))))),
             )
         )
     fig.frames = frames
@@ -1217,7 +1240,7 @@ def county_mobility_animation(income_panel: pd.DataFrame) -> go.Figure:
             dict(
                 x=222,
                 y=58,
-                text="Below the line: fell behind its own 1969 position",
+                text="Below the line: fell behind its 1969–79 position",
                 showarrow=False,
                 bgcolor="rgba(255,255,255,0.82)",
                 bordercolor=COLORS["grid"],
@@ -1227,8 +1250,8 @@ def county_mobility_animation(income_panel: pd.DataFrame) -> go.Figure:
         ],
         margin=dict(l=64, r=34, t=36, b=68),
     )
-    fig.update_xaxes(title="1969 per-capita personal income index, U.S. = 100", range=[0, 320])
-    fig.update_yaxes(title="Current-year per-capita personal income index, U.S. = 100", range=[0, 320])
+    fig.update_xaxes(title="1969–79 avg per-capita personal income index, U.S. = 100", range=[0, 320])
+    fig.update_yaxes(title=y_title_for(1979), range=[0, 320])
     fig = plot_layout(fig, height=510)
     fig.update_layout(margin=dict(l=64, r=34, t=36, b=68), sliders=[], updatemenus=[])
     return fig
@@ -1238,9 +1261,15 @@ def county_mobility_snapshot(income_panel: pd.DataFrame, year: int = 2024) -> go
     latest_pop = income_panel[income_panel["year"] == 2024][["county_fips", "population"]].rename(
         columns={"population": "population_2024"}
     )
-    baseline = income_panel[income_panel["year"] == 1969][
-        ["county_fips", "bea_county_name", "state_name", "income_index_us_100"]
-    ].rename(columns={"income_index_us_100": "baseline_index"})
+    baseline = (
+        income_panel[income_panel["year"].between(1969, 1979)]
+        .groupby("county_fips")["income_index_us_100"]
+        .mean()
+        .rename("baseline_index")
+        .reset_index()
+    )
+    meta = income_panel[income_panel["year"] == 1969][["county_fips", "bea_county_name", "state_name"]]
+    baseline = baseline.merge(meta, on="county_fips", how="left")
     panel = income_panel.merge(latest_pop, on="county_fips", how="left").merge(
         baseline, on=["county_fips", "bea_county_name", "state_name"], how="inner"
     )
@@ -1250,15 +1279,15 @@ def county_mobility_snapshot(income_panel: pd.DataFrame, year: int = 2024) -> go
         & panel["baseline_index"].notna()
         & panel["income_index_us_100"].notna()
     ].copy()
-    panel["index_change_since_1969"] = panel["income_index_us_100"] - panel["baseline_index"]
+    panel["index_change_since_baseline"] = panel["income_index_us_100"] - panel["baseline_index"]
 
     final = income_panel.merge(latest_pop, on="county_fips", how="left").merge(
         baseline, on=["county_fips", "bea_county_name", "state_name"], how="inner"
     )
     final = final[(final["population_2024"] >= 75_000) & (final["year"] == 2024)].copy()
-    final["index_change_since_1969"] = final["income_index_us_100"] - final["baseline_index"]
-    focus_counties = set(final.nlargest(8, "index_change_since_1969")["county_fips"])
-    focus_counties |= set(final.nsmallest(8, "index_change_since_1969")["county_fips"])
+    final["index_change_since_baseline"] = final["income_index_us_100"] - final["baseline_index"]
+    focus_counties = set(final.nlargest(8, "index_change_since_baseline")["county_fips"])
+    focus_counties |= set(final.nsmallest(8, "index_change_since_baseline")["county_fips"])
     panel["label"] = np.where(
         panel["county_fips"].isin(focus_counties) & (year == 2024),
         panel["bea_county_name"],
@@ -1275,11 +1304,11 @@ def county_mobility_snapshot(income_panel: pd.DataFrame, year: int = 2024) -> go
             textposition="top center",
             marker=dict(
                 size=np.clip(np.sqrt(panel["population_2024"]) / 62, 5, 30),
-                color=panel["index_change_since_1969"],
+                color=panel["index_change_since_baseline"],
                 colorscale=[[0, COLORS["red"]], [0.5, "#eeeeee"], [1, COLORS["teal"]]],
                 cmin=-80,
                 cmax=80,
-                colorbar=dict(title="Change vs. 1969"),
+                colorbar=dict(title="Change vs.\n1969–79 avg"),
                 opacity=0.74,
                 line=dict(width=0),
             ),
@@ -1288,7 +1317,7 @@ def county_mobility_snapshot(income_panel: pd.DataFrame, year: int = 2024) -> go
                     panel["bea_county_name"],
                     panel["state_name"],
                     panel["population_2024"],
-                    panel["index_change_since_1969"],
+                    panel["index_change_since_baseline"],
                     panel["per_capita_personal_income"],
                     panel["year"],
                 ],
@@ -1297,9 +1326,9 @@ def county_mobility_snapshot(income_panel: pd.DataFrame, year: int = 2024) -> go
             hovertemplate=(
                 "<b>%{customdata[0]}</b><br>"
                 "%{customdata[1]}<br>"
-                "1969 index: %{x:.1f}<br>"
+                "1969–79 avg index: %{x:.1f}<br>"
                 "%{customdata[5]:.0f} index: %{y:.1f}<br>"
-                "Change since 1969: %{customdata[3]:+.1f}<br>"
+                "Change since 1969–79 avg: %{customdata[3]:+.1f}<br>"
                 "Per-capita personal income: $%{customdata[4]:,.0f}<br>"
                 "2024 population: %{customdata[2]:,.0f}<extra></extra>"
             ),
@@ -1332,7 +1361,7 @@ def county_mobility_snapshot(income_panel: pd.DataFrame, year: int = 2024) -> go
             ),
         ],
     )
-    fig.update_xaxes(title="1969 per-capita personal income index, U.S. = 100", range=[0, 320])
+    fig.update_xaxes(title="1969–79 avg per-capita personal income index, U.S. = 100", range=[0, 320])
     fig.update_yaxes(title=f"{year} per-capita personal income index, U.S. = 100", range=[0, 320])
     fig = plot_layout(fig, height=690)
     fig.update_layout(margin=dict(l=64, r=34, t=86, b=86))
@@ -1355,50 +1384,136 @@ def county_breakout_atlas(mode: str = "mobility", show_buttons: bool = True) -> 
 
     df = pd.read_csv(dataset_path, dtype={"county_fips": str})
     residuals = pd.read_csv(residual_path, dtype={"county_fips": str})
+    df["county_fips"] = df["county_fips"].astype(str).str.zfill(5)
+    if "county_fips" in residuals.columns:
+        residuals["county_fips"] = residuals["county_fips"].astype(str).str.zfill(5)
+
+    required_df_cols = {
+        "county_fips",
+        "bea_county_name",
+        "state_name",
+        "population_2024",
+        "mobility_5yr_avg",
+        "income_index_1969_1973",
+        "income_index_2020_2024",
+    }
+    missing_df_cols = sorted(required_df_cols - set(df.columns))
+    if missing_df_cols:
+        fig = go.Figure()
+        fig.add_annotation(
+            text=(
+                "Atlas cannot render because county_mobility_ml_dataset.csv is missing required columns: "
+                + ", ".join(missing_df_cols)
+            ),
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=520)
+    breakouts_path = CLEAN / "county_income_breakouts_1969_2024.csv"
+    if breakouts_path.exists():
+        vol = pd.read_csv(breakouts_path, dtype={"county_fips": str})[
+            ["county_fips", "income_index_volatility", "high_volatility", "income_index_start", "income_index_end", "income_index_change"]
+        ]
+        vol["county_fips"] = vol["county_fips"].astype(str).str.zfill(5)
+        df = df.merge(vol, on="county_fips", how="left")
+        if "income_index_start" in df.columns:
+            df["income_index_1969_1973"] = df["income_index_start"].combine_first(df["income_index_1969_1973"])
+        if "income_index_end" in df.columns:
+            df["income_index_2020_2024"] = df["income_index_end"].combine_first(df["income_index_2020_2024"])
+        if "income_index_change" in df.columns:
+            df["mobility_5yr_avg"] = df["income_index_change"].combine_first(df["mobility_5yr_avg"])
     with geojson_path.open() as f:
         full_geojson = json.load(f)
+
     df = df[df["population_2024"] >= 50_000].copy()
-    if "county_fips" not in residuals.columns:
+    df = df[df["county_fips"].notna()].copy()
+    if df.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No counties meet the atlas population filter (>= 50k) in county_mobility_ml_dataset.csv.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=520)
+
+    if "county_fips" not in residuals.columns and "bea_county_name" in residuals.columns:
         residuals = residuals.merge(
             df[["county_fips", "bea_county_name"]],
             on="bea_county_name",
             how="left",
             suffixes=("", "_from_dataset"),
         )
+    if "county_fips" in residuals.columns:
+        residuals["county_fips"] = residuals["county_fips"].astype(str).str.zfill(5)
+    else:
+        residuals["county_fips"] = np.nan
+    if "residual_mobility" not in residuals.columns:
+        residuals["residual_mobility"] = np.nan
 
-    raw_selected = pd.concat(
-        [
-            df.nlargest(18, "mobility_5yr_avg").assign(atlas_group="Top breakout"),
-            df.nsmallest(18, "mobility_5yr_avg").assign(atlas_group="Largest loss"),
-        ],
-        ignore_index=True,
-    )
-    residual_selected = pd.concat(
-        [
-            residuals.nlargest(18, "residual_mobility").assign(atlas_group="Model overperformer"),
-            residuals.nsmallest(18, "residual_mobility").assign(atlas_group="Model underperformer"),
-        ],
-        ignore_index=True,
-    )
-    residual_selected = residual_selected.merge(
-        df[
-            [
-                "county_fips",
-                "income_index_1969_1973",
-                "income_index_2020_2024",
-                "pcpi_2024",
-            ]
-        ],
-        on="county_fips",
-        how="left",
-        suffixes=("", "_dataset"),
-    )
+    enrich_cols = [
+        "county_fips",
+        "bea_county_name",
+        "state_name",
+        "population_2024",
+        "income_index_1969_1973",
+        "income_index_2020_2024",
+        "pcpi_2024",
+        "bachelors_or_higher_pct",
+        "county_gdp_per_capita",
+        "engine_label",
+        "income_index_volatility",
+        "high_volatility",
+    ]
+    enrich_cols = [col for col in enrich_cols if col in df.columns]
+    residuals = residuals.merge(df[enrich_cols], on="county_fips", how="left", suffixes=("", "_dataset"))
+    for col in ["bea_county_name", "state_name", "population_2024", "income_index_1969_1973", "income_index_2020_2024", "pcpi_2024", "bachelors_or_higher_pct", "county_gdp_per_capita", "engine_label", "income_index_volatility", "high_volatility"]:
+        dataset_col = f"{col}_dataset"
+        if dataset_col in residuals.columns:
+            if col in residuals.columns:
+                residuals[col] = residuals[col].combine_first(residuals[dataset_col])
+            else:
+                residuals[col] = residuals[dataset_col]
+            residuals = residuals.drop(columns=[dataset_col])
+
+    def select_extremes(frame: pd.DataFrame, value_col: str, top_label: str, bottom_label: str, n: int = 18) -> pd.DataFrame:
+        if value_col not in frame.columns:
+            return pd.DataFrame(columns=list(frame.columns) + ["atlas_group"])
+        clean = frame.dropna(subset=[value_col, "county_fips"]).copy()
+        if clean.empty:
+            return pd.DataFrame(columns=list(frame.columns) + ["atlas_group"])
+        take = min(n, len(clean))
+        top = clean.nlargest(take, value_col).assign(atlas_group=top_label)
+        bottom = clean.nsmallest(take, value_col).assign(atlas_group=bottom_label)
+        return pd.concat([top, bottom], ignore_index=True).drop_duplicates("county_fips")
+
+    raw_selected = select_extremes(df, "mobility_5yr_avg", "Top breakout", "Largest loss")
+    residual_selected = select_extremes(residuals, "residual_mobility", "Model overperformer", "Model underperformer")
+    if raw_selected.empty and residual_selected.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Atlas has no counties to plot after filtering and score checks.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=520)
 
     selected_fips = set(raw_selected["county_fips"].dropna()) | set(residual_selected["county_fips"].dropna())
     filtered_geojson = {
         "type": "FeatureCollection",
-        "features": [feature for feature in full_geojson["features"] if feature["id"] in selected_fips],
+        "features": [feature for feature in full_geojson.get("features", []) if str(feature.get("id", "")).zfill(5) in selected_fips],
     }
+    if not filtered_geojson["features"]:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Atlas could not match selected counties to geojson-counties-fips.json feature IDs.",
+            showarrow=False,
+            x=0.5,
+            y=0.5,
+        )
+        return plot_layout(fig, height=520)
 
     def note(row: pd.Series) -> str:
         parts = []
@@ -1422,22 +1537,52 @@ def county_breakout_atlas(mode: str = "mobility", show_buttons: bool = True) -> 
             parts.append(row["engine_label"].lower())
         return "; ".join(parts[:3]) if parts else "notable outlier"
 
+    def _safe_float(value: object) -> float | None:
+        num = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        if pd.isna(num):
+            return None
+        return float(num)
+
+    def _fmt_num(value: object, fmt: str = ".1f", signed: bool = False, unit: str = "") -> str:
+        num = _safe_float(value)
+        if num is None:
+            return "n/a"
+        if signed:
+            return f"{num:+{fmt}}{unit}"
+        return f"{num:{fmt}}{unit}"
+
+    def _fmt_int(value: object, prefix: str = "", suffix: str = "") -> str:
+        num = _safe_float(value)
+        if num is None:
+            return "n/a"
+        return f"{prefix}{num:,.0f}{suffix}"
+
     def hover_text(frame: pd.DataFrame, value_col: str) -> pd.Series:
-        return frame.apply(
-            lambda row: (
-                f"<b>{row['bea_county_name']}</b><br>"
-                f"{row['state_name']}<br>"
-                f"{row['atlas_group']}<br>"
-                f"Map value: {row[value_col]:+.1f}<br>"
-                f"Income index: {row['income_index_1969_1973']:.1f} to {row['income_index_2020_2024']:.1f}<br>"
-                f"2024 population: {row['population_2024']:,.0f}<br>"
-                f"Bachelor's share: {row.get('bachelors_or_higher_pct', np.nan):.1f}%<br>"
-                f"GDP per person: ${row.get('county_gdp_per_capita', np.nan):,.0f}<br>"
-                f"Economic engine: {row.get('engine_label', 'not classified')}<br>"
+        def _row(row: pd.Series) -> str:
+            vol = row.get("income_index_volatility", np.nan)
+            high_vol = row.get("high_volatility", False)
+            vol_str = _fmt_num(vol)
+            vol_flag = " ⚠ high path volatility" if high_vol else ""
+            county_name = row.get("bea_county_name", "Unknown county")
+            state_name = row.get("state_name", "Unknown state")
+            if pd.isna(county_name):
+                county_name = "Unknown county"
+            if pd.isna(state_name):
+                state_name = "Unknown state"
+            return (
+                f"<b>{county_name}</b><br>"
+                f"{state_name}<br>"
+                f"{row.get('atlas_group', 'Selected county')}<br>"
+                f"Map value: {_fmt_num(row.get(value_col), signed=True)}<br>"
+                f"Income index: {_fmt_num(row.get('income_index_1969_1973'))} (1969–79 avg) to {_fmt_num(row.get('income_index_2020_2024'))} (2020–24 avg)<br>"
+                f"2024 population: {_fmt_int(row.get('population_2024'))}<br>"
+                f"Bachelor's share: {_fmt_num(row.get('bachelors_or_higher_pct'), unit='%')}<br>"
+                f"GDP per person: {_fmt_int(row.get('county_gdp_per_capita'), prefix='$')}<br>"
+                f"Economic engine: {row.get('engine_label', 'not classified') if pd.notna(row.get('engine_label', np.nan)) else 'not classified'}<br>"
+                f"Path volatility (σ): {vol_str}{vol_flag}<br>"
                 f"Note: {note(row)}"
-            ),
-            axis=1,
-        )
+            )
+        return frame.apply(_row, axis=1)
 
     raw_selected["hover_label"] = hover_text(raw_selected, "mobility_5yr_avg")
     residual_selected["hover_label"] = hover_text(residual_selected, "residual_mobility")
@@ -1446,7 +1591,7 @@ def county_breakout_atlas(mode: str = "mobility", show_buttons: bool = True) -> 
     fig.add_trace(
         go.Choroplethmap(
                 geojson=filtered_geojson,
-                locations=raw_selected["county_fips"],
+                locations=raw_selected["county_fips"].astype(str).str.zfill(5),
                 z=raw_selected["mobility_5yr_avg"],
                 featureidkey="id",
                 colorscale=[
@@ -1462,7 +1607,7 @@ def county_breakout_atlas(mode: str = "mobility", show_buttons: bool = True) -> 
                 marker_line_color="#ffffff",
                 colorbar=dict(title="Breakout<br>score"),
                 text=raw_selected["hover_label"],
-                customdata=raw_selected["county_fips"],
+                customdata=raw_selected["county_fips"].astype(str).str.zfill(5),
                 hovertemplate="%{text}<extra></extra>",
                 name="Breakout Score",
                 visible=(mode == "mobility"),
@@ -1471,7 +1616,7 @@ def county_breakout_atlas(mode: str = "mobility", show_buttons: bool = True) -> 
     fig.add_trace(
         go.Choroplethmap(
                 geojson=filtered_geojson,
-                locations=residual_selected["county_fips"],
+                locations=residual_selected["county_fips"].astype(str).str.zfill(5),
                 z=residual_selected["residual_mobility"],
                 featureidkey="id",
                 colorscale=[
@@ -1487,7 +1632,7 @@ def county_breakout_atlas(mode: str = "mobility", show_buttons: bool = True) -> 
                 marker_line_color="#ffffff",
                 colorbar=dict(title="Residual<br>index points"),
                 text=residual_selected["hover_label"],
-                customdata=residual_selected["county_fips"],
+                customdata=residual_selected["county_fips"].astype(str).str.zfill(5),
                 hovertemplate="%{text}<extra></extra>",
                 name="Model residual",
                 visible=(mode == "residual"),
@@ -1621,40 +1766,83 @@ def atlas_story_records(limit_each: int = 18) -> list[dict[str, object]]:
         return []
 
     df = pd.read_csv(dataset_path, dtype={"county_fips": str})
+    required_cols = {
+        "county_fips",
+        "bea_county_name",
+        "state_name",
+        "population_2024",
+        "mobility_5yr_avg",
+        "income_index_1969_1973",
+        "income_index_2020_2024",
+    }
+    if not required_cols.issubset(df.columns):
+        return []
+
+    df["county_fips"] = df["county_fips"].astype(str).str.zfill(5)
     df = df[df["population_2024"] >= 50_000].copy()
+    df = df.dropna(subset=["county_fips", "mobility_5yr_avg"]).copy()
+    if df.empty:
+        return []
+
+    take = min(limit_each, len(df))
     selected = pd.concat(
         [
-            df.nlargest(limit_each, "mobility_5yr_avg").assign(atlas_group="Top breakout"),
-            df.nsmallest(limit_each, "mobility_5yr_avg").assign(atlas_group="Largest loss"),
+            df.nlargest(take, "mobility_5yr_avg").assign(atlas_group="Top breakout"),
+            df.nsmallest(take, "mobility_5yr_avg").assign(atlas_group="Largest loss"),
         ],
         ignore_index=True,
     )
     selected = selected.drop_duplicates("county_fips").sort_values(["state_name", "bea_county_name"])
 
+    def to_float_or_none(value: object, digits: int = 1) -> float | None:
+        num = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        if pd.isna(num):
+            return None
+        return round(float(num), digits)
+
+    def to_int_or_none(value: object) -> int | None:
+        num = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        if pd.isna(num):
+            return None
+        return int(num)
+
+    def to_str_or_default(value: object, default: str) -> str:
+        if pd.isna(value):
+            return default
+        text = str(value).strip()
+        return text if text else default
+
     records = []
     for _, row in selected.iterrows():
-        fips = row["county_fips"]
+        fips = to_str_or_default(row.get("county_fips"), "")
+        if not fips:
+            continue
         override = ATLAS_STORY_OVERRIDES.get(fips, {})
-        direction = "gained" if row["mobility_5yr_avg"] >= 0 else "lost"
-        engine = row.get("engine_label", "not classified")
+        mobility_value = pd.to_numeric(pd.Series([row.get("mobility_5yr_avg")]), errors="coerce").iloc[0]
+        if pd.isna(mobility_value):
+            continue
+        direction = "gained" if mobility_value >= 0 else "lost"
+        engine = to_str_or_default(row.get("engine_label"), "not classified")
+        county_name = to_str_or_default(row.get("bea_county_name"), "Unknown county")
+        state_name = to_str_or_default(row.get("state_name"), "Unknown state")
         default_note = (
-            f"{row['bea_county_name']} {direction} {abs(row['mobility_5yr_avg']):.1f} points of national income position. "
-            f"Its current engine label is {str(engine).lower()}."
+            f"{county_name} {direction} {abs(float(mobility_value)):.1f} points of national income position. "
+            f"Its current engine label is {engine.lower()}."
         )
         records.append(
             {
                 "fips": fips,
-                "name": row["bea_county_name"],
-                "state": row["state_name"],
-                "group": row["atlas_group"],
-                "headline": override.get("headline", row["bea_county_name"]),
-                "image": override.get("image", "https://commons.wikimedia.org/wiki/Special:Redirect/file/United_States_relief_location_map.jpg"),
-                "note": override.get("note", default_note),
-                "breakout": round(float(row["mobility_5yr_avg"]), 1),
-                "start": round(float(row["income_index_1969_1973"]), 1),
-                "end": round(float(row["income_index_2020_2024"]), 1),
-                "population": int(row["population_2024"]),
-                "engine": engine if isinstance(engine, str) else "not classified",
+                "name": county_name,
+                "state": state_name,
+                "group": to_str_or_default(row.get("atlas_group"), "Selected county"),
+                "headline": to_str_or_default(override.get("headline"), county_name),
+                "image": to_str_or_default(override.get("image"), ""),
+                "note": to_str_or_default(override.get("note"), default_note),
+                "breakout": to_float_or_none(row.get("mobility_5yr_avg")),
+                "start": to_float_or_none(row.get("income_index_1969_1973")),
+                "end": to_float_or_none(row.get("income_index_2020_2024")),
+                "population": to_int_or_none(row.get("population_2024")),
+                "engine": engine,
             }
         )
     return records
@@ -1935,7 +2123,7 @@ def industry_composition_lens() -> go.Figure:
                 color=[color_map.get(label, COLORS["muted"]) for label in summary["engine_label"].astype(str)],
                 line=dict(color="#ffffff", width=0.8),
             ),
-            text=[f"{v:.1f}%" for v in summary["avg_engine_share"]],
+            text=[f"{v:+.1f}" for v in summary["pop_weighted_mobility"]],
             textposition="outside",
             customdata=np.stack(
                 [
@@ -1973,19 +2161,26 @@ def industry_composition_lens() -> go.Figure:
         line=dict(color=COLORS["ink"], width=1, dash="dot"),
     )
     fig.update_layout(
-        title="The breakout pattern has a clear industry signature",
+        title="Industry engine type strongly aligns with breakout mobility",
         margin=dict(l=196, r=34, t=84, b=96),
         uniformtext_minsize=10,
         uniformtext_mode="hide",
     )
-    fig.update_xaxes(title="Population-weighted mobility (income-index change)")
+    x_pad = max(5.0, float(summary["pop_weighted_mobility"].abs().max()) * 0.12)
+    fig.update_xaxes(
+        title="Population-weighted breakout score",
+        range=[
+            float(summary["pop_weighted_mobility"].min()) - x_pad,
+            float(summary["pop_weighted_mobility"].max()) + x_pad,
+        ],
+    )
     fig.update_yaxes(title="")
     fig.add_annotation(
         x=0.02,
         y=-0.2,
         xref="paper",
         yref="paper",
-        text="Bar labels show the average GDP share of that county engine. Source: BEA CAGDP2 current-dollar county GDP by industry.",
+        text="Bar labels are population-weighted breakout scores; hover for average engine GDP share and county counts. Source: BEA CAGDP2 current-dollar county GDP by industry.",
         showarrow=False,
         font=dict(size=12, color=COLORS["muted"]),
         align="left",
@@ -2081,6 +2276,83 @@ def county_quality_of_life_lens() -> go.Figure:
         align="left",
     )
     return plot_layout(fig, height=640)
+
+
+def volatility_vs_breakout_lens() -> go.Figure:
+    path = CLEAN / "county_income_breakouts_1969_2024.csv"
+    if not path.exists():
+        fig = go.Figure()
+        fig.add_annotation(text="Run build script once to generate county_income_breakouts_1969_2024.csv.", showarrow=False, x=0.5, y=0.5)
+        return plot_layout(fig, height=520)
+
+    df = pd.read_csv(path, dtype={"county_fips": str})
+    df = df.dropna(subset=["income_index_volatility", "income_index_change"]).copy()
+    large = df[df["population_end"] >= 50_000].copy()
+
+    vol_thresh = df["income_index_volatility"].quantile(0.75)
+
+    fig = go.Figure()
+    fig.add_shape(type="line", x0=0, x1=0, y0=df["income_index_volatility"].min(), y1=df["income_index_volatility"].max(), line=dict(color="#aaaaaa", width=1, dash="dot"))
+    fig.add_shape(type="line", y0=vol_thresh, y1=vol_thresh, x0=df["income_index_change"].min(), x1=df["income_index_change"].max(), line=dict(color=COLORS["teal"], width=1, dash="dash"))
+    fig.add_annotation(x=df["income_index_change"].max(), y=vol_thresh, text="Top-quartile volatility", showarrow=False, xanchor="right", yanchor="bottom", font=dict(size=11, color=COLORS["teal"]))
+
+    # All counties, small markers
+    fig.add_trace(go.Scattergl(
+        x=df["income_index_change"],
+        y=df["income_index_volatility"],
+        mode="markers",
+        marker=dict(size=3, color="#cccccc", opacity=0.5),
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+
+    # Large counties, labeled
+    labels = set(large.nlargest(10, "income_index_volatility")["county_fips"]) | \
+             set(large.nlargest(8, "income_index_change")["county_fips"]) | \
+             set(large.nsmallest(8, "income_index_change")["county_fips"])
+
+    fig.add_trace(go.Scattergl(
+        x=large["income_index_change"],
+        y=large["income_index_volatility"],
+        mode="markers+text",
+        text=[row.bea_county_name if row.county_fips in labels else "" for row in large.itertuples()],
+        textposition="top center",
+        marker=dict(
+            size=np.clip(np.sqrt(large["population_end"]) / 60, 5, 28),
+            color=large["income_index_change"],
+            colorscale=[[0, COLORS["red"]], [0.5, "#eeeeee"], [1, COLORS["teal"]]],
+            cmin=-80, cmax=80,
+            opacity=0.8,
+            line=dict(width=0),
+        ),
+        customdata=np.stack([
+            large["bea_county_name"],
+            large["state_name"],
+            large["income_index_change"].round(1),
+            large["income_index_volatility"].round(1),
+            large["population_end"],
+        ], axis=-1),
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "%{customdata[1]}<br>"
+            "Breakout score: %{customdata[2]:+.1f}<br>"
+            "Path volatility (σ): %{customdata[3]}<br>"
+            "Population: %{customdata[4]:,.0f}<extra></extra>"
+        ),
+        name="Counties ≥50k pop",
+    ))
+
+    fig.update_xaxes(title="Breakout score (index-point change, 1969–2024)", zeroline=False)
+    fig.update_yaxes(title="Path volatility (σ of income index, 1969–2024)", zeroline=False)
+    fig.update_layout(
+        title="High path volatility is spread across winners and losers alike",
+        annotations=[dict(
+            text="Each point is a county. Breakout score on x-axis; std dev of annual income index on y-axis. Dashed line = 75th-percentile volatility threshold. Counties below 50k population shown as grey dots.",
+            xref="paper", yref="paper", x=0, y=-0.14, xanchor="left", yanchor="top",
+            showarrow=False, font=dict(size=11, color="#666666"),
+        )],
+    )
+    return plot_layout(fig, height=560)
 
 
 def qol_breakout_correlation_lens() -> go.Figure:
@@ -2311,8 +2583,10 @@ def education_income_diagnostics() -> go.Figure:
     diagnostics = pd.read_csv(diagnostics_path)
     current = diagnostics[diagnostics["outcome"] == "income_index_2020_2024"].iloc[0]
     mobility = diagnostics[diagnostics["outcome"] == "mobility_5yr_avg"].iloc[0]
-    labels = set(df.nlargest(7, "income_residual_after_controls")["bea_county_name"])
-    labels |= set(df.nsmallest(7, "income_residual_after_controls")["bea_county_name"])
+    labels = set(
+        df.assign(abs_income_residual=np.abs(df["income_residual_after_controls"]))
+        .nlargest(8, "abs_income_residual")["bea_county_name"]
+    )
 
     fig = make_subplots(
         rows=1,
@@ -2324,22 +2598,23 @@ def education_income_diagnostics() -> go.Figure:
             "After starting income, population, and state controls",
         ),
     )
-    marker = dict(
+    marker_main = dict(
         size=np.clip(np.sqrt(df["population_2024"]) / 76, 4, 24),
         color=df["mobility_5yr_avg"],
         colorscale=[[0, COLORS["red"]], [0.5, "#eeeeee"], [1, COLORS["teal"]]],
         cmin=-60,
         cmax=60,
-        colorbar=dict(title="Mobility"),
+        colorbar=dict(title="Breakout<br>score"),
         opacity=0.68,
         line=dict(width=0),
     )
+    marker_resid = dict(marker_main, showscale=False)
     fig.add_trace(
         go.Scattergl(
             x=df["bachelors_or_higher_pct"],
             y=df["income_index_2020_2024"],
             mode="markers",
-            marker=marker,
+            marker=marker_main,
             customdata=np.stack(
                 [
                     df["bea_county_name"],
@@ -2384,7 +2659,7 @@ def education_income_diagnostics() -> go.Figure:
             mode="markers+text",
             text=[name if name in labels else "" for name in df["bea_county_name"]],
             textposition="top center",
-            marker=marker,
+            marker=marker_resid,
             customdata=np.stack(
                 [
                     df["bea_county_name"],
@@ -2433,9 +2708,25 @@ def education_income_diagnostics() -> go.Figure:
     )
     fig.add_hline(y=0, line_color=COLORS["grid"], line_width=1, row=1, col=2)
     fig.add_vline(x=0, line_color=COLORS["grid"], line_width=1, row=1, col=2)
+    fig.add_vline(
+        x=float(df["bachelors_or_higher_pct"].median()),
+        line_color=COLORS["grid"],
+        line_width=1,
+        line_dash="dot",
+        row=1,
+        col=1,
+    )
+    fig.add_hline(
+        y=float(df["income_index_2020_2024"].median()),
+        line_color=COLORS["grid"],
+        line_width=1,
+        line_dash="dot",
+        row=1,
+        col=1,
+    )
     fig.update_layout(
         title=(
-            "Education is not just correlated with income; it adds signal after controls"
+            "Education signal remains strong after controls"
         ),
         annotations=[
             *list(fig.layout.annotations),
@@ -2450,21 +2741,24 @@ def education_income_diagnostics() -> go.Figure:
                 bordercolor=COLORS["grid"],
                 borderpad=5,
                 font=dict(size=12, color=COLORS["ink"]),
+                align="left",
             ),
             dict(
-                x=0.73,
+                x=0.97,
                 y=1.02,
                 xref="paper",
                 yref="paper",
+                xanchor="right",
                 text=(
-                    f"Education adds +{current['incremental_education_r2']:.2f} R2 for current income; "
-                    f"+{mobility['incremental_education_r2']:.2f} for mobility"
+                    f"Incremental R2 from education: +{current['incremental_education_r2']:.2f} (current income), "
+                    f"+{mobility['incremental_education_r2']:.2f} (mobility)"
                 ),
                 showarrow=False,
                 bgcolor="rgba(255,255,255,0.86)",
                 bordercolor=COLORS["grid"],
                 borderpad=5,
                 font=dict(size=12, color=COLORS["ink"]),
+                align="right",
             ),
         ],
     )
@@ -2495,12 +2789,9 @@ def model_diagnostics() -> go.Figure:
         "bachelors_or_higher_pct",
         "unemployment_pct",
         "median_household_income",
-        "poverty_pct",
         "county_gdp_per_capita",
         "broadband_pct",
         "mean_commute_minutes",
-        "management_science_arts_occupation_pct",
-        "worked_from_home_pct",
     ]
     model_df = df[["mobility_5yr_avg", *feature_cols]].replace([np.inf, -np.inf], np.nan).dropna().copy()
     model_df["breakout_up"] = (model_df["mobility_5yr_avg"] > 0).astype(int)
@@ -2542,31 +2833,65 @@ def model_diagnostics() -> go.Figure:
     acc = accuracy_score(y_test, preds)
     base_rate = y.mean()
 
-    def pretty_feature(name: str) -> str:
-        return (
-            name.replace("_pct", " share")
-            .replace("county_gdp_per_capita", "county GDP per capita")
-            .replace("_", " ")
-            .title()
-        )
+    feature_label_map = {
+        "income_index_1969_1973": "1969–73 income index",
+        "bachelors_or_higher_pct": "Bachelor's+ share",
+        "unemployment_pct": "Unemployment rate",
+        "median_household_income": "Median household income",
+        "county_gdp_per_capita": "County GDP per capita",
+        "broadband_pct": "Broadband share",
+        "mean_commute_minutes": "Mean commute (minutes)",
+    }
 
-    coef = pd.Series(model.coef_.ravel(), index=feature_cols)
-    kept = coef[np.abs(coef) > 1e-5].copy()
-    if kept.empty:
-        kept = coef.abs().sort_values(ascending=False).head(6)
-        kept = coef.loc[kept.index]
-    kept = kept.sort_values()
+    def pretty_feature(name: str) -> str:
+        return feature_label_map.get(name, name.replace("_", " "))
+
+    # Bootstrap coefficients: 200 resamples on the training set, refit L1 logistic
+    # on each, record the standardized coefficient distribution per feature.
+    B = 200
+    rng = np.random.default_rng(42)
+    n_train = X_train_s.shape[0]
+    boot_coefs = np.zeros((B, len(feature_cols)))
+    best_C = float(np.atleast_1d(model.C_)[0])
+    from sklearn.linear_model import LogisticRegression as _LR
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for b in range(B):
+            idx = rng.integers(0, n_train, size=n_train)
+            yb = y_train.values[idx]
+            if yb.mean() in (0.0, 1.0):
+                continue
+            _m = _LR(
+                C=best_C,
+                penalty="l1",
+                solver="saga",
+                max_iter=4000,
+                random_state=int(rng.integers(0, 10_000)),
+            )
+            _m.fit(X_train_s[idx], yb)
+            boot_coefs[b] = _m.coef_.ravel()
+
+    coef_point = model.coef_.ravel()
+    q05 = np.quantile(boot_coefs, 0.05, axis=0)
+    q50 = np.quantile(boot_coefs, 0.50, axis=0)
+    q95 = np.quantile(boot_coefs, 0.95, axis=0)
+    pct_nonzero = (np.abs(boot_coefs) > 1e-5).mean(axis=0) * 100
     coef_df = pd.DataFrame(
         {
-            "feature": kept.index,
-            "feature_label": [pretty_feature(c) for c in kept.index],
-            "coef": kept.values,
-            "odds_ratio": np.exp(kept.values),
+            "feature": feature_cols,
+            "feature_label": [pretty_feature(c) for c in feature_cols],
+            "coef": coef_point,
+            "coef_median": q50,
+            "coef_lo": q05,
+            "coef_hi": q95,
+            "pct_nonzero": pct_nonzero,
+            "odds_ratio": np.exp(coef_point),
         }
     )
+    coef_df = coef_df.sort_values("coef_median")
 
     calib = pd.DataFrame({"pred_prob": probs, "actual": y_test.values})
-    calib["bin"] = pd.qcut(calib["pred_prob"], q=8, duplicates="drop")
+    calib["bin"] = pd.qcut(calib["pred_prob"], q=6, duplicates="drop")
     calib = (
         calib.groupby("bin", observed=True, as_index=False)
         .agg(
@@ -2576,95 +2901,112 @@ def model_diagnostics() -> go.Figure:
         )
         .sort_values("mean_pred_prob")
     )
+    calib["bin_label"] = calib["bin"].apply(
+        lambda interval: (
+            f"{int(round(interval.left * 100))}–{int(round(interval.right * 100))}%"
+            if pd.notna(interval)
+            else "n/a"
+        )
+    )
 
     fig = make_subplots(
         rows=1,
         cols=2,
         column_widths=[0.5, 0.5],
-        horizontal_spacing=0.12,
+        horizontal_spacing=0.28,
         subplot_titles=(
-            "Logistic calibration: predicted vs observed breakout rate",
-            "Kept predictors (L1 logistic odds ratios)",
+            "Calibration by predicted-probability bin",
+            "Standardized coefficient (5–95% bootstrap band, 200 reps)",
         ),
     )
     fig.add_trace(
-        go.Bar(
-            x=calib["mean_pred_prob"] * 100,
-            y=calib["actual_rate"] * 100,
-            marker=dict(color=COLORS["teal"], line=dict(color="#ffffff", width=0.8)),
+        go.Scatter(
+            x=calib["bin_label"],
+            y=calib["mean_pred_prob"] * 100,
+            mode="lines+markers",
+            line=dict(color=COLORS["gold"], width=3),
+            marker=dict(size=8),
             customdata=np.stack([calib["count"]], axis=-1),
             hovertemplate=(
-                "Predicted breakout probability: %{x:.1f}%<br>"
-                "Observed breakout rate: %{y:.1f}%<br>"
+                "Predicted breakout probability: %{y:.1f}%<br>"
                 "Counties in bin: %{customdata[0]:.0f}<extra></extra>"
             ),
-            name="Observed",
-            showlegend=False,
+            name="Predicted rate",
         ),
         row=1,
         col=1,
     )
     fig.add_trace(
         go.Scatter(
-            x=calib["mean_pred_prob"] * 100,
-            y=calib["mean_pred_prob"] * 100,
+            x=calib["bin_label"],
+            y=calib["actual_rate"] * 100,
             mode="lines+markers",
-            line=dict(color=COLORS["ink"], width=2, dash="dot"),
-            marker=dict(size=6),
-            hoverinfo="skip",
-            showlegend=False,
+            line=dict(color=COLORS["teal"], width=3),
+            marker=dict(size=8),
+            customdata=np.stack([calib["count"]], axis=-1),
+            hovertemplate=(
+                "Observed breakout rate: %{y:.1f}%<br>"
+                "Counties in bin: %{customdata[0]:.0f}<extra></extra>"
+            ),
+            name="Observed rate",
         ),
         row=1,
         col=1,
     )
 
     fig.add_trace(
-        go.Bar(
-            x=coef_df["odds_ratio"],
+        go.Scatter(
+            x=coef_df["coef_median"],
             y=coef_df["feature_label"],
-            orientation="h",
+            mode="markers",
             marker=dict(
-                color=[COLORS["teal"] if c > 0 else COLORS["red"] for c in coef_df["coef"]],
-                line=dict(color="#ffffff", width=0.8),
+                size=11,
+                color=[COLORS["teal"] if c > 0 else COLORS["red"] for c in coef_df["coef_median"]],
+                line=dict(color="#ffffff", width=1.2),
             ),
-            customdata=np.stack([coef_df["coef"]], axis=-1),
+            error_x=dict(
+                type="data",
+                symmetric=False,
+                array=(coef_df["coef_hi"] - coef_df["coef_median"]).values,
+                arrayminus=(coef_df["coef_median"] - coef_df["coef_lo"]).values,
+                thickness=2,
+                width=6,
+                color="rgba(23,23,23,0.55)",
+            ),
+            customdata=np.stack(
+                [coef_df["coef_lo"], coef_df["coef_hi"], coef_df["pct_nonzero"], coef_df["odds_ratio"]],
+                axis=-1,
+            ),
             hovertemplate=(
                 "<b>%{y}</b><br>"
-                "Odds ratio (1 SD increase): %{x:.2f}<br>"
-                "Coefficient: %{customdata[0]:+.2f}<extra></extra>"
+                "Median coef: %{x:+.2f}<br>"
+                "5–95%% band: %{customdata[0]:+.2f} to %{customdata[1]:+.2f}<br>"
+                "Selected in %{customdata[2]:.0f}%% of bootstraps<br>"
+                "Odds ratio (point): %{customdata[3]:.2f}<extra></extra>"
             ),
             showlegend=False,
         ),
         row=1,
         col=2,
     )
-    fig.add_vline(x=1, line_color=COLORS["ink"], line_width=1, line_dash="dot", row=1, col=2)
+    fig.add_vline(x=0, line_color=COLORS["ink"], line_width=1, line_dash="dot", row=1, col=2)
 
-    fig.update_layout(
-        title="Simple breakout model: multivariable logistic regression (L1-pruned)",
-        showlegend=False,
+    fig.update_layout(showlegend=True, legend=dict(orientation="h", y=1.02, x=0.01))
+    fig.update_xaxes(title="Predicted breakout-probability bin", tickangle=-30, row=1, col=1)
+    fig.update_yaxes(title="Breakout rate (%)", row=1, col=1)
+    x_lo = float(coef_df["coef_lo"].min())
+    x_hi = float(coef_df["coef_hi"].max())
+    pad = max(0.15, (x_hi - x_lo) * 0.12)
+    fig.update_xaxes(
+        title="Standardized logistic coefficient (log-odds per +1 SD)",
+        range=[x_lo - pad, x_hi + pad],
+        row=1,
+        col=2,
     )
-    fig.update_xaxes(title="Predicted breakout probability (%)", row=1, col=1)
-    fig.update_yaxes(title="Observed breakout rate (%)", row=1, col=1)
-    fig.update_xaxes(title="Odds ratio for moving up", row=1, col=2)
     fig.update_yaxes(title="", automargin=True, row=1, col=2)
-    fig = plot_layout(fig, height=620)
-    fig.update_layout(margin=dict(l=90, r=34, t=96, b=80))
-    fig.add_annotation(
-        x=0.01,
-        y=1.08,
-        xref="paper",
-        yref="paper",
-        xanchor="left",
-        yanchor="top",
-        text=(
-            f"n={len(model_df):,} counties | baseline breakout rate={base_rate*100:.1f}% | "
-            f"AUC={auc:.2f} | accuracy={acc:.2f} | kept predictors={len(coef_df)}"
-        ),
-        showarrow=False,
-        font=dict(size=12, color=COLORS["muted"]),
-        align="left",
-    )
+    fig = plot_layout(fig, height=560)
+    fig.update_layout(margin=dict(l=90, r=86, t=64, b=96))
+    fig.add_hline(y=base_rate * 100, line_color=COLORS["grid"], line_width=1, line_dash="dot", row=1, col=1)
     return fig
 
 
@@ -3605,6 +3947,209 @@ def state_engine_breakdown(county: pd.DataFrame, latest: pd.DataFrame) -> go.Fig
     return fig
 
 
+COUNTRY_GDP_2023_BILLIONS = [
+    ("China", 17795),
+    ("Germany", 4456),
+    ("Japan", 4213),
+    ("India", 3568),
+    ("United Kingdom", 3340),
+    ("France", 3031),
+    ("Italy", 2255),
+    ("Brazil", 2174),
+    ("Canada", 2140),
+    ("Russia", 2021),
+    ("Mexico", 1789),
+    ("Australia", 1724),
+    ("South Korea", 1713),
+    ("Spain", 1581),
+    ("Indonesia", 1371),
+    ("Netherlands", 1118),
+    ("Turkey", 1108),
+    ("Saudi Arabia", 1069),
+    ("Switzerland", 884),
+    ("Poland", 811),
+    ("Belgium", 644),
+    ("Sweden", 584),
+    ("Ireland", 546),
+    ("Israel", 525),
+    ("Thailand", 514),
+    ("Singapore", 501),
+    ("UAE", 504),
+    ("Norway", 486),
+    ("Philippines", 437),
+    ("Denmark", 407),
+    ("Malaysia", 399),
+    ("Hong Kong", 382),
+    ("South Africa", 377),
+    ("Colombia", 363),
+    ("Finland", 300),
+    ("Portugal", 287),
+    ("New Zealand", 252),
+    ("Greece", 243),
+    ("Hungary", 212),
+    ("Morocco", 144),
+    ("Slovakia", 130),
+    ("Ecuador", 118),
+    ("Kenya", 108),
+    ("Iceland", 31),
+]
+
+
+def _state_outline_svg(state_fips: str, width: int = 220, height: int = 140) -> str:
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+
+    geo_path = RAW / "geojson-counties-fips.json"
+    if not geo_path.exists():
+        return ""
+    with open(geo_path) as f:
+        geo = json.load(f)
+    polys = []
+    for feat in geo["features"]:
+        if feat.get("properties", {}).get("STATE") == state_fips:
+            polys.append(shape(feat["geometry"]))
+    if not polys:
+        return ""
+    merged = unary_union(polys).simplify(0.02, preserve_topology=True)
+    minx, miny, maxx, maxy = merged.bounds
+    pad = 0.04 * max(maxx - minx, maxy - miny)
+    minx -= pad; miny -= pad; maxx += pad; maxy += pad
+    sx = width / (maxx - minx)
+    sy = height / (maxy - miny)
+    scale = min(sx, sy)
+    ox = (width - (maxx - minx) * scale) / 2
+    oy = (height - (maxy - miny) * scale) / 2
+
+    def project(x, y):
+        return (ox + (x - minx) * scale, height - oy - (y - miny) * scale)
+
+    def ring_to_path(ring):
+        pts = [project(x, y) for x, y in ring]
+        if not pts:
+            return ""
+        head = f"M {pts[0][0]:.1f} {pts[0][1]:.1f}"
+        tail = " ".join(f"L {x:.1f} {y:.1f}" for x, y in pts[1:])
+        return f"{head} {tail} Z"
+
+    paths = []
+    geoms = merged.geoms if merged.geom_type == "MultiPolygon" else [merged]
+    for g in geoms:
+        paths.append(ring_to_path(list(g.exterior.coords)))
+        for hole in g.interiors:
+            paths.append(ring_to_path(list(hole.coords)))
+    d = " ".join(paths)
+    return (
+        f'<svg viewBox="0 0 {width} {height}" width="100%" preserveAspectRatio="xMidYMid meet" '
+        f'xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'
+        f'<path d="{d}" fill="rgba(34,124,128,0.18)" stroke="#227c80" stroke-width="1.4" stroke-linejoin="round"/>'
+        f'</svg>'
+    )
+
+
+def build_state_focus_cards_html(latest: pd.DataFrame, state_names: list[str]) -> str:
+    countries = pd.DataFrame(
+        [{"label": name, "gdp_b": float(val)} for name, val in COUNTRY_GDP_2023_BILLIONS]
+    )
+    state_lookup = latest.set_index("state")["gdp"].to_dict()
+    fips_by_name = {v: k for k, v in STATE_FIPS.items()}
+    cards = []
+    for state in state_names:
+        gdp = state_lookup.get(state)
+        if gdp is None:
+            continue
+        gdp_b = gdp / 1e9
+        ranked = countries.assign(diff=(countries["gdp_b"] - gdp_b).abs()).sort_values("diff")
+        nearest = ranked.head(3).sort_values("gdp_b", ascending=False)
+        fips = fips_by_name.get(state, "")
+        svg = _state_outline_svg(fips) if fips else ""
+        rows = []
+        max_val = max(gdp_b, nearest["gdp_b"].max())
+        rows.append(
+            f'<div class="focus-bar focus-bar-state">'
+            f'<div class="focus-bar-label">{state}</div>'
+            f'<div class="focus-bar-track"><div class="focus-bar-fill" style="width:{(gdp_b / max_val * 100):.1f}%"></div></div>'
+            f'<div class="focus-bar-value">${gdp_b:,.0f}B</div>'
+            f'</div>'
+        )
+        for _, row in nearest.iterrows():
+            rows.append(
+                f'<div class="focus-bar focus-bar-country">'
+                f'<div class="focus-bar-label">{row["label"]}</div>'
+                f'<div class="focus-bar-track"><div class="focus-bar-fill" style="width:{(row["gdp_b"] / max_val * 100):.1f}%"></div></div>'
+                f'<div class="focus-bar-value">${row["gdp_b"]:,.0f}B</div>'
+                f'</div>'
+            )
+        closest = nearest.iloc[(nearest["gdp_b"] - gdp_b).abs().argsort()[:1]].iloc[0]
+        cards.append(
+            f'''
+            <button type="button" class="focus-card" data-focus-card>
+              <div class="focus-card-map">{svg}</div>
+              <div class="focus-card-head">
+                <div class="focus-card-state">{state}</div>
+                <div class="focus-card-gdp">2023 GDP · ${gdp_b:,.0f} billion</div>
+                <div class="focus-card-match">≈ {closest["label"]} (${closest["gdp_b"]:,.0f}B)</div>
+              </div>
+              <div class="focus-card-bars">{"".join(rows)}</div>
+            </button>
+            '''
+        )
+    return f'<div class="focus-cards" data-focus-cards>{"".join(cards)}</div>'
+
+
+def state_vs_country_gdp(latest: pd.DataFrame) -> go.Figure:
+    states = (
+        latest[["state", "gdp"]]
+        .dropna()
+        .assign(label=lambda d: d["state"], kind="State", gdp_b=lambda d: d["gdp"] / 1e9)
+        [["label", "gdp_b", "kind"]]
+    )
+    countries = pd.DataFrame(
+        [{"label": name, "gdp_b": float(val), "kind": "Country"} for name, val in COUNTRY_GDP_2023_BILLIONS]
+    )
+    combined = pd.concat([states, countries], ignore_index=True)
+    combined = combined.sort_values("gdp_b", ascending=True).reset_index(drop=True)
+    order = combined["label"].tolist()
+
+    state_rows = combined[combined["kind"] == "State"]
+    country_rows = combined[combined["kind"] == "Country"]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=country_rows["gdp_b"],
+            y=country_rows["label"],
+            orientation="h",
+            name="Country",
+            marker=dict(color=COLORS["gold"], line=dict(width=0)),
+            opacity=0.12,
+            hovertemplate="<b>%{y}</b><br>2023 GDP: $%{x:,.0f} B<extra>Country</extra>",
+            meta="country",
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=state_rows["gdp_b"],
+            y=state_rows["label"],
+            orientation="h",
+            name="U.S. state",
+            marker=dict(color=COLORS["teal"], line=dict(width=0)),
+            opacity=0.95,
+            hovertemplate="<b>%{y}</b><br>2023 GDP: $%{x:,.0f} B<extra>U.S. state</extra>",
+            meta="state",
+        )
+    )
+    fig.update_yaxes(categoryorder="array", categoryarray=order, tickfont=dict(size=10))
+    fig.update_xaxes(title="2023 GDP (USD, billions, nominal)", type="log", tickformat="$~s")
+    fig.update_layout(
+        barmode="overlay",
+        bargap=0.25,
+        legend=dict(orientation="h", y=1.04, x=0, yanchor="bottom"),
+        margin=dict(l=160, r=32, t=24, b=56),
+    )
+    fig = plot_layout(fig, height=1280)
+    return fig
+
+
 def state_mobility_distributions() -> go.Figure:
     dataset_path = CLEAN / "county_mobility_ml_dataset.csv"
     summary_path = CLEAN / "county_mobility_state_summary.csv"
@@ -3622,6 +4167,37 @@ def state_mobility_distributions() -> go.Figure:
     summary = pd.read_csv(summary_path)
     summary = summary[summary["state_name"] != "District of Columbia"].copy()
     counties = counties[counties["state_name"].isin(summary["state_name"])].copy()
+    breakouts_path = CLEAN / "county_income_breakouts_1969_2024.csv"
+    if breakouts_path.exists():
+        bk = pd.read_csv(breakouts_path, dtype={"county_fips": str})[
+            ["county_fips", "income_index_start", "income_index_end", "income_index_change"]
+        ]
+        counties["county_fips"] = counties["county_fips"].astype(str).str.zfill(5)
+        counties = counties.merge(bk, on="county_fips", how="left")
+        counties["mobility_5yr_avg"] = counties["income_index_change"].combine_first(counties["mobility_5yr_avg"])
+        counties["income_index_1969_1973"] = counties["income_index_start"].combine_first(counties["income_index_1969_1973"])
+        counties["income_index_2020_2024"] = counties["income_index_end"].combine_first(counties["income_index_2020_2024"])
+        # Recompute state-level summary from updated county values
+        summary_new = (
+            counties.dropna(subset=["mobility_5yr_avg", "population_2024"])
+            .groupby("state_name")
+            .apply(lambda g: pd.Series({
+                "pop_weighted_mobility": np.average(g["mobility_5yr_avg"], weights=g["population_2024"]),
+                "p25_mobility": g["mobility_5yr_avg"].quantile(0.25),
+                "median_mobility": g["mobility_5yr_avg"].median(),
+                "p75_mobility": g["mobility_5yr_avg"].quantile(0.75),
+            }), include_groups=False)
+            .reset_index()
+        )
+        summary = summary.merge(summary_new, on="state_name", how="left", suffixes=("_old", ""))
+        for col in ["pop_weighted_mobility", "p25_mobility", "median_mobility", "p75_mobility"]:
+            if f"{col}_old" in summary.columns:
+                summary[col] = summary[col].combine_first(summary[f"{col}_old"])
+                summary.drop(columns=[f"{col}_old"], inplace=True)
+        order = summary.sort_values("pop_weighted_mobility")["state_name"].tolist()
+        summary["state_name"] = pd.Categorical(summary["state_name"], categories=order, ordered=True)
+        counties["state_name"] = pd.Categorical(counties["state_name"], categories=order, ordered=True)
+        summary = summary.sort_values("state_name")
     order = summary.sort_values("pop_weighted_mobility")["state_name"].tolist()
     summary["state_name"] = pd.Categorical(summary["state_name"], categories=order, ordered=True)
     counties["state_name"] = pd.Categorical(counties["state_name"], categories=order, ordered=True)
@@ -3663,7 +4239,7 @@ def state_mobility_distributions() -> go.Figure:
                 "<b>%{customdata[0]}</b><br>"
                 "%{y}<br>"
                 "Mobility: %{x:+.1f}<br>"
-                "Index: %{customdata[2]:.1f} to %{customdata[3]:.1f}<br>"
+                "Index: %{customdata[2]:.1f} (1969–79 avg) to %{customdata[3]:.1f} (2020–24 avg)<br>"
                 "2024 population: %{customdata[1]:,.0f}<extra></extra>"
             ),
             name="Counties",
@@ -3727,8 +4303,15 @@ def state_mobility_distributions() -> go.Figure:
         ],
     )
     fig.update_xaxes(title="County mobility: income-index change, 1969-1973 to 2020-2024")
-    fig.update_yaxes(title="", categoryorder="array", categoryarray=order)
-    fig = plot_layout(fig, height=980)
+    fig.update_yaxes(
+        title="",
+        categoryorder="array",
+        categoryarray=order,
+        tickmode="linear",
+        dtick=1,
+        tickfont=dict(size=10),
+    )
+    fig = plot_layout(fig, height=760)
     fig.update_layout(margin=dict(l=148, r=34, t=86, b=86))
     return fig
 
@@ -3773,98 +4356,113 @@ def make_html(
         (
             "1",
             "Counties Move",
-            "The national state hierarchy is stable, but counties inside it can radically reorder.",
+            "Metric: county per-capita personal income indexed to the U.S. average (U.S. = 100), BEA CAINC1, 1969–2024.",
             county_mobility_animation(county_income_panel),
         ),
         (
             "2",
-            "States Differ",
-            "State context matters, but each state still contains counties moving in very different directions.",
-            state_mobility_distributions(),
+            "States On The World Stage",
+            "Metric: 2023 nominal GDP (USD billions) for U.S. states (BEA, teal) interleaved with national economies (World Bank, gold). Log scale.",
+            state_vs_country_gdp(latest),
         ),
         (
             "3",
-            "Metro Lens",
-            "This summary strips away point-cloud noise: large metros host most upside, but several nonmetro settings still produce breakouts.",
-            metro_nonmetro_lens(),
+            "States Differ",
+            "Metric: distribution of county Breakout Scores within each state. Breakout Score = 2020–2024 avg relative-income index minus 1969–1979 avg.",
+            state_mobility_distributions(),
         ),
         (
             "4",
-            "Industry Signature",
-            "Breakout gains cluster in command-style county economies; engine share labels show how dominant each engine is in its counties.",
-            industry_composition_lens(),
+            "Metro Lens",
+            "Metric: county Breakout Score grouped by USDA ERS 2023 Rural-Urban Continuum Code (metro vs nonmetro tiers).",
+            metro_nonmetro_lens(),
         ),
         (
             "5",
             "What Factors Matter?",
-            "A simple multivariable logistic model shows which county factors increase or reduce the odds of moving up.",
+            "Metric: L1-regularized logistic regression predicting whether a county's Breakout Score is positive (it gained relative-income ground vs. 1969–79). Features were trimmed to reduce collinearity (pairs with r > 0.8 or VIF > 10 dropped). Right panel shows the standardized coefficient with a 5–95% band from 200 bootstrap resamples — overlap with zero means the effect is not stable. Note: the 1969–73 income-index coefficient is negative because counties that started high had less room to rise — that is mechanical reversion, not a causal factor. This is a descriptive fit, not a causal or out-of-sample forecast.",
             model_diagnostics(),
         ),
         (
             "6",
             "Breakout Atlas",
-            "After the pattern is established, the atlas lets you explore who broke out and who fell behind.",
+            "Metric: county Breakout Score mapped on 2023 county polygons (BEA CAINC1 long-run relative per-capita income change).",
             county_breakout_atlas(show_buttons=False),
+        ),
+        (
+            "7",
+            "Industry Signature",
+            "Metric: dominant 2023 industry share of county GDP (BEA CAGDP2) plotted against Breakout Score.",
+            industry_composition_lens(),
         ),
     ]
     support_charts = [
         (
             "A",
             "Education Gradient",
-            "Education remains a strong income signal even after controlling for where counties started, how large they were, and which state they are in.",
+            "Metric: ACS 2023 bachelor's-or-higher share vs GDP per capita and Breakout Score, with residuals after controlling for metro class and population.",
             education_income_diagnostics(),
         ),
         (
             "B",
             "State Engines",
-            "The best states are portfolios of county engines, not just one famous superstar county.",
+            "Metric: share of state GDP produced by each state's top-GDP county, plus county GDP per capita, 2023.",
             state_engine_breakdown(county, latest),
         ),
         (
             "C",
             "County Quality Of Life",
-            "A county-level quality-of-life composite makes it easier to benchmark local outcomes with one comparable score.",
+            "Metric: composite z-scored index across income, poverty, education, unemployment, and housing from ACS 2023.",
             county_quality_of_life_lens(),
         ),
         (
             "D",
             "QoL vs Breakout Correlation",
-            "This links the composite quality-of-life score directly to breakout mobility to show how tightly they move together.",
+            "Metric: Pearson correlation between the QoL composite and Breakout Score across counties, with scatter and fit line.",
             qol_breakout_correlation_lens(),
         ),
         (
             "E",
             "County Clusters (K-Means)",
-            "K-means groups counties into simple archetypes so you can see which county types are consistently moving up.",
+            "Metric: K-means (K=3) clusters on standardized county traits; centroid profiles on each feature.",
             kmeans_cluster_lens(),
         ),
         (
             "F",
             "Clusters On The Map",
-            "Same K-means archetypes, now mapped so we can see where each county type is concentrated.",
+            "Metric: K-means (K=3) cluster assignment mapped on county polygons.",
             kmeans_cluster_map(),
         ),
         (
             "G",
             "Picking K",
-            "Quick elbow + silhouette diagnostics to sanity-check whether K=3 is a defensible cluster count.",
+            "Metric: within-cluster sum of squares (elbow) and silhouette score across K = 2–10.",
             kmeans_k_diagnostic(),
         ),
         (
             "H",
             "KMeans vs GMM",
-            "Side-by-side metrics for K=3 so you can see whether Gaussian mixtures outperform standard K-means.",
+            "Metric: silhouette, BIC, and log-likelihood for K-means vs Gaussian mixture at K=3.",
             cluster_model_check(),
         ),
         (
             "I",
             "GMM Tied Map",
-            "A direct map of GMM (tied covariance, K=3) clusters so you can compare geographic structure vs K-means.",
+            "Metric: Gaussian mixture (tied covariance, K=3) cluster assignment mapped on county polygons.",
             gmm_tied_cluster_map(),
+        ),
+        (
+            "J",
+            "Path Volatility vs Breakout Score",
+            "Metric: standard deviation of annual changes in the county relative-income index, 1969–2024, plotted against Breakout Score.",
+            volatility_vs_breakout_lens(),
         ),
     ]
     atlas_records = atlas_story_records()
-    atlas_json = json.dumps(atlas_records, ensure_ascii=False).replace("</", "<\\/")
+    try:
+        atlas_json = json.dumps(atlas_records, ensure_ascii=False, allow_nan=False).replace("</", "<\\/")
+    except ValueError:
+        atlas_json = "[]"
 
     def chart_section_html(num: str, title: str, note: str, fig: go.Figure) -> str:
         is_atlas = title == "Breakout Atlas"
@@ -3873,25 +4471,27 @@ def make_html(
         controls = ""
         plot_html = f'<div class="plot-wrap">{fig_html(fig, f"story-{num}")}</div>'
         if num == "1":
-            tick_years = [1969, 1977, 1985, 1993, 2001, 2009, 2017, 2024]
+            tick_years = [1979, 1986, 1993, 2000, 2007, 2014, 2021, 2024]
             ticks = "".join(f"<span>{year}</span>" for year in tick_years)
             controls = f"""
           <div class="custom-timeline" data-plot="story-1">
             <div class="timeline-row">
               <div>
                 <div class="timeline-label">Animation year</div>
-                <div class="timeline-year"><span data-year-label>1969</span></div>
+                <div class="timeline-year"><span data-year-label>1979</span></div>
               </div>
               <div class="timeline-actions">
                 <button type="button" data-action="play">Play</button>
                 <button type="button" data-action="pause">Pause</button>
               </div>
             </div>
-            <input aria-label="Select year" data-year-slider type="range" min="1969" max="2024" value="1969" step="1">
+            <input aria-label="Select year" data-year-slider type="range" min="1979" max="2024" value="1979" step="1">
             <div class="timeline-ticks">{ticks}</div>
-            <div class="timeline-caption">Drag through income history, or play the animation from the 1969 baseline.</div>
+            <div class="timeline-caption">Drag through income history, or play the animation from the 1979 starting year.</div>
           </div>
             """
+        if num == "2":
+            controls = build_state_focus_cards_html(latest, ["California", "Texas", "Florida"])
         if is_atlas:
             options = "\n".join(
                 f'<option value="{record["fips"]}">{record["state"]} · {record["name"]}</option>'
@@ -3967,7 +4567,7 @@ def make_html(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Why Some State Economies Compound</title>
+  <title>Why Some County Economies Break Out</title>
   <script src="https://cdn.plot.ly/plotly-{PLOTLY_JS_VERSION}.min.js"></script>
   <style>
     :root {{
@@ -4146,14 +4746,29 @@ def make_html(
       font-size: 14px;
     }}
     .metric-definition {{
-      border-left: 3px solid var(--teal);
-      padding: 12px 16px;
-      margin-top: 24px;
+      border-left: 5px solid var(--teal);
+      padding: 16px 20px;
+      margin-top: 28px;
       max-width: 880px;
-      color: #2f2f2f;
-      background: rgba(255,255,255,0.78);
+      color: #1a1a1a;
+      background: rgba(255,255,255,0.92);
       border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-      font-size: 16px;
+      font-size: 15px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.10);
+    }}
+    .metric-definition .score-label {{
+      display: block;
+      font-weight: 700;
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--teal);
+      margin-bottom: 6px;
+    }}
+    .metric-definition .katex-formula {{
+      display: block;
+      margin: 6px 0 4px;
+      font-size: 15px;
     }}
     .storyline {{
       display: grid;
@@ -4403,6 +5018,102 @@ def make_html(
     .plot-wrap .js-plotly-plot {{
       width: 100%;
     }}
+    .focus-cards {{
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 18px;
+      margin-top: 22px;
+    }}
+    @media (max-width: 880px) {{
+      .focus-cards {{ grid-template-columns: 1fr; }}
+    }}
+    .focus-card {{
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      padding: 18px 18px 20px;
+      background: #ffffff;
+      border: 1px solid rgba(23,23,23,0.12);
+      border-radius: var(--radius-md);
+      box-shadow: var(--shadow-soft);
+      text-align: left;
+      font: inherit;
+      color: inherit;
+      cursor: pointer;
+      transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
+    }}
+    .focus-card:hover,
+    .focus-card.is-active {{
+      transform: translateY(-3px);
+      box-shadow: var(--shadow-strong);
+      border-color: rgba(34,124,128,0.45);
+    }}
+    .focus-card-map {{
+      height: 120px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(34,124,128,0.04);
+      border-radius: var(--radius-sm);
+      padding: 8px;
+    }}
+    .focus-card-map svg {{ max-height: 100%; }}
+    .focus-card-state {{
+      font-family: "New York", Georgia, "Times New Roman", serif !important;
+      font-size: 26px;
+      line-height: 1.1;
+    }}
+    .focus-card-gdp {{
+      color: var(--muted);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+      font-weight: 700;
+      margin-top: 2px;
+    }}
+    .focus-card-match {{
+      margin-top: 6px;
+      font-size: 14px;
+      color: var(--teal);
+      font-weight: 600;
+    }}
+    .focus-card-bars {{
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }}
+    .focus-bar {{
+      display: grid;
+      grid-template-columns: 92px 1fr 62px;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+    }}
+    .focus-bar-label {{
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+    .focus-bar-track {{
+      height: 8px;
+      background: rgba(23,23,23,0.07);
+      border-radius: 999px;
+      overflow: hidden;
+    }}
+    .focus-bar-fill {{
+      height: 100%;
+      background: var(--gold);
+      border-radius: 999px;
+      transition: width 600ms ease;
+    }}
+    .focus-bar-state .focus-bar-fill {{ background: var(--teal); }}
+    .focus-bar-state .focus-bar-label {{ font-weight: 700; }}
+    .focus-bar-value {{
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      color: var(--muted);
+    }}
+    .focus-bar-state .focus-bar-value {{ color: var(--ink); font-weight: 700; }}
     .custom-timeline {{
       border: 1px solid rgba(23,23,23,0.14);
       border-top: 0;
@@ -4608,24 +5319,21 @@ def make_html(
       }}
     }}
   </style>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {{delimiters: [{{left:'\\\\(',right:'\\\\)',display:false}},{{left:'\\\\[',right:'\\\\]',display:true}}]}})"></script>
 </head>
 <body>
   <main class="page">
     <header style="--hero-bg: url('{bg_uri}')">
-      <div class="masthead">
-        <div class="mark">County Engines</div>
-        <div class="links">
-          <span>States</span>
-          <span>Metro</span>
-          <span>Industry</span>
-          <span>Factors</span>
-          <span>Atlas</span>
-        </div>
-      </div>
-      <div class="eyebrow">State GDP, human capital, and county engines</div>
+
       <h1>Why some county economies break out.</h1>
-      <p class="thesis">Some county economies do not rise because their state magically compounds. They rise when high-skill labor, command functions, and specialized industries concentrate in particular labor markets.</p>
-      <div class="metric-definition">Breakout Score = change in county per-capita personal-income position from the 1969-1973 average to the 2020-2024 average, with the U.S. average equal to 100 each year.</div>
+      <div class="metric-definition">
+        <span class="score-label">Breakout Score</span>
+        <span class="katex-formula">\\[\\text{{Breakout Score}} = \\bar{{I}}_{{2020\\text{{--}}2024}} - \\bar{{I}}_{{1969\\text{{--}}1979}}, \\quad I_y = \\frac{{\\text{{county per-capita income}}_y}}{{\\text{{U.S. per-capita income}}_y}} \\times 100\\]</span>
+        Ten-year baseline (1969–1979) reduces sensitivity to early-era shocks; five-year endpoint average (2020–2024) smooths recent noise. U.S.&nbsp;=&nbsp;100 each year removes inflation and national growth.
+      </div>
       <div class="metrics">
         <div class="metric">
           <div class="label">Outcome</div>
@@ -4655,25 +5363,11 @@ def make_html(
       </div>
     </header>
 
-    <section class="storyline">
-      <div>
-        <h2>The six-visual story</h2>
-        <p>Counties move. States still differ. Metro scale and industry structure shape the odds, and the model helps rank which factors matter most before the atlas reveals specific winners and laggards.</p>
-      </div>
-      <div class="script">
-        <p><strong>Opening claim:</strong> county engines, not state magic.</p>
-        <p><strong>State spread:</strong> states differ, but counties inside a state still diverge.</p>
-        <p><strong>Mechanism:</strong> metro scale and industry composition shape breakout potential.</p>
-        <p><strong>Model lens:</strong> factor importance quantifies which traits carry signal.</p>
-      </div>
-    </section>
-
     {chart_sections}
 
     <section class="support-intro">
       <div class="section-kicker">Appendix</div>
-      <h2>What supports the claim?</h2>
-      <p>These diagnostics are useful for questions after the six-visual story. They deepen the core narrative without adding clutter to the main sequence.</p>
+      <h2>Supporting Evidence</h2>
     </section>
 
     {support_sections}
@@ -4702,6 +5396,68 @@ def make_html(
         {{ rootMargin: "0px 0px -12% 0px", threshold: 0.18 }}
       );
       revealTargets.forEach((target) => observer.observe(target));
+    }})();
+
+    (function () {{
+      const section = document.getElementById("chart-2");
+      const plot = document.getElementById("story-2");
+      if (!section || !plot || !window.Plotly) return;
+      const reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const targetOpacity = 0.82;
+      const startOpacity = 0.12;
+      let revealed = false;
+      function findCountryTraceIndex() {{
+        const data = plot.data || [];
+        for (let i = 0; i < data.length; i++) {{
+          if (data[i] && data[i].meta === "country") return i;
+        }}
+        return -1;
+      }}
+      function setOpacity(value) {{
+        const idx = findCountryTraceIndex();
+        if (idx < 0) return;
+        Plotly.restyle(plot, {{ opacity: value }}, [idx]);
+      }}
+      if (reduced) {{
+        setOpacity(targetOpacity);
+        return;
+      }}
+      const steps = 24;
+      function animate(from, to) {{
+        let i = 0;
+        const step = () => {{
+          i += 1;
+          const t = Math.min(1, i / steps);
+          const eased = 1 - Math.pow(1 - t, 3);
+          setOpacity(from + (to - from) * eased);
+          if (t < 1) window.requestAnimationFrame(step);
+        }};
+        window.requestAnimationFrame(step);
+      }}
+      const obs = new IntersectionObserver(
+        (entries) => {{
+          entries.forEach((entry) => {{
+            if (!entry.isIntersecting || revealed) return;
+            revealed = true;
+            animate(startOpacity, targetOpacity);
+            obs.unobserve(entry.target);
+          }});
+        }},
+        {{ threshold: 0.35 }}
+      );
+      obs.observe(section);
+    }})();
+
+    (function () {{
+      const cards = document.querySelectorAll("[data-focus-card]");
+      if (!cards.length) return;
+      cards.forEach((card) => {{
+        card.addEventListener("click", () => {{
+          const wasActive = card.classList.contains("is-active");
+          cards.forEach((c) => c.classList.remove("is-active"));
+          if (!wasActive) card.classList.add("is-active");
+        }});
+      }});
     }})();
 
     (function () {{
@@ -4756,9 +5512,13 @@ def make_html(
       play.addEventListener("click", function () {{
         stop();
         timer = window.setInterval(function () {{
-          const next = Number(slider.value) >= Number(slider.max)
-            ? Number(slider.min)
-            : Number(slider.value) + 1;
+          const current = Number(slider.value);
+          const max = Number(slider.max);
+          if (current >= max) {{
+            stop();
+            return;
+          }}
+          const next = current + 1;
           animateTo(next);
         }}, 280);
       }});
@@ -4775,8 +5535,21 @@ def make_html(
       const card = document.querySelector("[data-atlas-card]");
       const toggle = document.querySelector("[data-atlas-toggle]");
       if (!plot || !dataEl || !card || !window.Plotly) return;
+      const fallbackImage = "https://commons.wikimedia.org/wiki/Special:Redirect/file/United_States_relief_location_map.jpg";
 
-      const records = JSON.parse(dataEl.textContent || "[]");
+      let records = [];
+      try {{
+        const parsed = JSON.parse(dataEl.textContent || "[]");
+        records = Array.isArray(parsed) ? parsed : [];
+      }} catch (error) {{
+        console.warn("Atlas record payload failed to parse.", error);
+        records = [];
+      }}
+      if (!records.length) {{
+        card.classList.add("is-collapsed");
+        if (toggle) toggle.style.display = "none";
+        return;
+      }}
       const byFips = new Map(records.map((record) => [String(record.fips), record]));
       const select = card.querySelector("[data-atlas-select]");
       const image = card.querySelector("[data-atlas-image]");
@@ -4786,6 +5559,7 @@ def make_html(
       const score = card.querySelector("[data-atlas-score]");
       const index = card.querySelector("[data-atlas-index]");
       const engine = card.querySelector("[data-atlas-engine]");
+      if (!image || !kicker || !title || !note || !score || !index || !engine) return;
 
       function setCardOpen(isOpen) {{
         card.classList.toggle("is-collapsed", !isOpen);
@@ -4797,21 +5571,75 @@ def make_html(
       }}
 
       function fmt(value) {{
+        if (!Number.isFinite(value)) return "n/a";
         return value > 0 ? "+" + value.toFixed(1) : value.toFixed(1);
+      }}
+
+      function fmtIndex(value) {{
+        if (!Number.isFinite(value)) return "n/a";
+        return value.toFixed(1);
+      }}
+
+      function toCssUrl(value) {{
+        if (typeof value !== "string" || !value.trim()) return "";
+        return value.replace(/["'()\\\\\\n\\r]/g, "");
+      }}
+
+      function countyTitleVariants(record) {{
+        const rawName = typeof record.name === "string" ? record.name.trim() : "";
+        const rawState = typeof record.state === "string" ? record.state.trim() : "";
+        if (!rawName || !rawState) return [];
+        const variants = [];
+        variants.push(rawName + ", " + rawState);
+        if (!/county|parish|borough|census area|municipality|city/i.test(rawName)) {{
+          variants.push(rawName + " County, " + rawState);
+        }}
+        variants.push(rawName + " County");
+        return Array.from(new Set(variants));
+      }}
+
+      async function fetchWikipediaImage(title) {{
+        const endpoint = "https://en.wikipedia.org/api/rest_v1/page/summary/" + encodeURIComponent(title);
+        try {{
+          const response = await fetch(endpoint, {{
+            headers: {{ "Accept": "application/json" }}
+          }});
+          if (!response.ok) return "";
+          const payload = await response.json();
+          const image = payload && payload.thumbnail && payload.thumbnail.source;
+          return typeof image === "string" ? image : "";
+        }} catch (_error) {{
+          return "";
+        }}
+      }}
+
+      async function hydrateRecordImages() {{
+        for (const record of records) {{
+          const current = typeof record.image === "string" ? record.image.trim() : "";
+          if (current && current !== fallbackImage) continue;
+          let image = "";
+          const candidates = countyTitleVariants(record);
+          for (const title of candidates) {{
+            image = await fetchWikipediaImage(title);
+            if (image) break;
+          }}
+          record.image = image || fallbackImage;
+        }}
       }}
 
       function render(fips, shouldOpen) {{
         const record = byFips.get(String(fips)) || records[0];
         if (!record) return;
         if (select) select.value = record.fips;
+        const img = toCssUrl(record.image || fallbackImage);
         image.style.backgroundImage =
-          "linear-gradient(180deg, rgba(23,23,23,0.04), rgba(23,23,23,0.58)), url('" + record.image + "')";
-        kicker.textContent = record.group + " · " + record.state;
-        title.textContent = record.headline;
-        note.textContent = record.note;
+          "linear-gradient(180deg, rgba(23,23,23,0.04), rgba(23,23,23,0.58)), url('" + img + "')";
+        kicker.textContent = (record.group || "Selected county") + " · " + (record.state || "Unknown state");
+        title.textContent = record.headline || record.name || "Selected county";
+        note.textContent = record.note || "No profile note available for this county.";
         score.textContent = fmt(Number(record.breakout));
-        index.textContent = record.start + " -> " + record.end;
-        engine.textContent = record.engine;
+        index.textContent = fmtIndex(Number(record.start)) + " -> " + fmtIndex(Number(record.end));
+        engine.textContent = record.engine || "not classified";
         if (shouldOpen) setCardOpen(true);
       }}
 
@@ -4829,12 +5657,17 @@ def make_html(
 
       plot.on("plotly_click", function (event) {{
         const point = event && event.points && event.points[0];
-        const fips = point && (point.customdata || point.location);
+        const raw = point && (point.customdata || point.location);
+        const fips = Array.isArray(raw) ? raw[0] : raw;
         if (fips) render(fips, true);
       }});
 
       setCardOpen(false);
       render(byFips.has("06085") ? "06085" : records[0] && records[0].fips, false);
+      hydrateRecordImages().then(function () {{
+        const current = select ? select.value : (records[0] && records[0].fips);
+        if (current) render(current, false);
+      }});
     }})();
   </script>
 </body>
