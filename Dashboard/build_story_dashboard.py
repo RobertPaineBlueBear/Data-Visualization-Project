@@ -4046,6 +4046,111 @@ def _state_outline_svg(state_fips: str, width: int = 220, height: int = 140) -> 
     )
 
 
+_COUNTRY_NAME_OVERRIDES = {
+    "UAE": "United Arab Emirates",
+    "Hong Kong": "Hong Kong S.A.R.",
+}
+
+_COUNTRY_GEO_CACHE: dict | None = None
+
+
+def _country_outline_svg(country_name: str, width: int = 120, height: int = 80) -> str:
+    from shapely.geometry import shape, MultiPolygon
+
+    global _COUNTRY_GEO_CACHE
+    geo_path = RAW / "countries.geojson"
+    if not geo_path.exists():
+        return ""
+    if _COUNTRY_GEO_CACHE is None:
+        with open(geo_path) as f:
+            raw = json.load(f)
+        _COUNTRY_GEO_CACHE = {
+            (feat.get("properties", {}).get("ADMIN") or feat.get("properties", {}).get("name")): feat
+            for feat in raw.get("features", [])
+        }
+    lookup_name = _COUNTRY_NAME_OVERRIDES.get(country_name, country_name)
+    feat = _COUNTRY_GEO_CACHE.get(lookup_name)
+    if feat is None:
+        return ""
+    geom = shape(feat["geometry"])
+    if geom.is_empty:
+        return ""
+    if geom.geom_type == "MultiPolygon":
+        parts = list(geom.geoms)
+        if parts:
+            max_part = max(parts, key=lambda p: p.area)
+            max_area = max_part.area
+            cx, cy = max_part.centroid.x, max_part.centroid.y
+
+            def keep(p):
+                if p.area >= 0.25 * max_area:
+                    return True
+                px, py = p.centroid.x, p.centroid.y
+                dist = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+                return dist <= 20 and p.area >= 0.02 * max_area
+
+            kept = [p for p in parts if keep(p)]
+            if kept:
+                geom = MultiPolygon(kept) if len(kept) > 1 else kept[0]
+    minx, miny, maxx, maxy = geom.bounds
+    if (maxx - minx) > 180:
+        from shapely.geometry import Polygon, MultiPolygon
+
+        def shift_coords(coords):
+            return [((x + 360) if x < 0 else x, y) for x, y in coords]
+
+        def shift_poly(poly):
+            ext = shift_coords(list(poly.exterior.coords))
+            holes = [shift_coords(list(r.coords)) for r in poly.interiors]
+            return Polygon(ext, holes)
+
+        if geom.geom_type == "MultiPolygon":
+            geom = MultiPolygon([shift_poly(p) for p in geom.geoms])
+        else:
+            geom = shift_poly(geom)
+        minx, miny, maxx, maxy = geom.bounds
+    geom = geom.simplify(0.08, preserve_topology=True)
+    if geom.is_empty:
+        return ""
+    minx, miny, maxx, maxy = geom.bounds
+    pad = 0.04 * max(maxx - minx, maxy - miny, 1e-6)
+    minx -= pad; miny -= pad; maxx += pad; maxy += pad
+    sx = width / (maxx - minx)
+    sy = height / (maxy - miny)
+    scale = min(sx, sy)
+    ox = (width - (maxx - minx) * scale) / 2
+    oy = (height - (maxy - miny) * scale) / 2
+
+    def project(x, y):
+        return (ox + (x - minx) * scale, height - oy - (y - miny) * scale)
+
+    def ring_to_path(ring):
+        pts = [project(x, y) for x, y in ring]
+        if len(pts) < 3:
+            return ""
+        head = f"M {pts[0][0]:.1f} {pts[0][1]:.1f}"
+        tail = " ".join(f"L {x:.1f} {y:.1f}" for x, y in pts[1:])
+        return f"{head} {tail} Z"
+
+    paths = []
+    geoms = geom.geoms if geom.geom_type == "MultiPolygon" else [geom]
+    for g in geoms:
+        if g.is_empty or not hasattr(g, "exterior"):
+            continue
+        paths.append(ring_to_path(list(g.exterior.coords)))
+        for hole in g.interiors:
+            paths.append(ring_to_path(list(hole.coords)))
+    d = " ".join(p for p in paths if p)
+    if not d:
+        return ""
+    return (
+        f'<svg class="focus-bar-mini" viewBox="0 0 {width} {height}" width="{width}" height="{height}" '
+        f'preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'
+        f'<path d="{d}" fill="rgba(193,154,48,0.22)" stroke="#c19a30" stroke-width="0.9" stroke-linejoin="round"/>'
+        f'</svg>'
+    )
+
+
 def build_state_focus_cards_html(latest: pd.DataFrame, state_names: list[str]) -> str:
     countries = pd.DataFrame(
         [{"label": name, "gdp_b": float(val)} for name, val in COUNTRY_GDP_2023_BILLIONS]
@@ -4071,7 +4176,9 @@ def build_state_focus_cards_html(latest: pd.DataFrame, state_names: list[str]) -
             f'<div class="focus-bar-value">${gdp_b:,.0f}B</div>'
             f'</div>'
         )
+        country_tiles = []
         for _, row in nearest.iterrows():
+            country_svg = _country_outline_svg(row["label"])
             rows.append(
                 f'<div class="focus-bar focus-bar-country">'
                 f'<div class="focus-bar-label">{row["label"]}</div>'
@@ -4079,11 +4186,24 @@ def build_state_focus_cards_html(latest: pd.DataFrame, state_names: list[str]) -
                 f'<div class="focus-bar-value">${row["gdp_b"]:,.0f}B</div>'
                 f'</div>'
             )
+            country_tiles.append(
+                f'<div class="focus-tile focus-tile-country">'
+                f'<div class="focus-tile-shape">{country_svg}</div>'
+                f'<div class="focus-tile-label">{row["label"]}</div>'
+                f'</div>'
+            )
         closest = nearest.iloc[(nearest["gdp_b"] - gdp_b).abs().argsort()[:1]].iloc[0]
         cards.append(
             f'''
             <button type="button" class="focus-card" data-focus-card>
-              <div class="focus-card-map">{svg}</div>
+              <div class="focus-card-shapes">
+                <div class="focus-tile focus-tile-state">
+                  <div class="focus-tile-shape">{svg}</div>
+                  <div class="focus-tile-label">{state}</div>
+                </div>
+                <div class="focus-card-vs">vs</div>
+                <div class="focus-tile-group">{"".join(country_tiles)}</div>
+              </div>
               <div class="focus-card-head">
                 <div class="focus-card-state">{state}</div>
                 <div class="focus-card-gdp">2023 GDP · ${gdp_b:,.0f} billion</div>
@@ -4094,6 +4214,342 @@ def build_state_focus_cards_html(latest: pd.DataFrame, state_names: list[str]) -
             '''
         )
     return f'<div class="focus-cards" data-focus-cards>{"".join(cards)}</div>'
+
+
+def size_vs_per_capita_ranks(latest: pd.DataFrame) -> go.Figure:
+    df = latest[["state", "gdp", "gdp_per_capita"]].dropna().copy()
+    df["rank_total"] = df["gdp"].rank(ascending=False, method="min").astype(int)
+    df["rank_pc"] = df["gdp_per_capita"].rank(ascending=False, method="min").astype(int)
+    df["delta"] = df["rank_total"] - df["rank_pc"]
+    n = len(df)
+
+    highlight = {"Texas", "Massachusetts", "Connecticut", "Florida", "Wyoming", "Louisiana"}
+
+    def classify(row) -> str:
+        if row["state"] not in highlight:
+            return "flat"
+        if row["delta"] >= 1:
+            return "rise"
+        if row["delta"] <= -1:
+            return "fall"
+        return "flat"
+
+    df["bucket"] = df.apply(classify, axis=1)
+    color_map = {
+        "rise": COLORS["blue"],
+        "fall": COLORS["blue"],
+        "flat": "#c8c8c8",
+    }
+    final_color_map = {
+        "rise": COLORS["blue"],
+        "fall": COLORS["red"],
+        "flat": "#c8c8c8",
+    }
+    width_map = {"rise": 2.6, "fall": 2.6, "flat": 1.1}
+    opacity_map = {"rise": 0.98, "fall": 0.98, "flat": 0.45}
+
+    X_CENTER = 0.5
+    X_LEFT = 0.0
+    X_RIGHT = 1.0
+    NEUTRAL = "#b8b8b8"
+
+    def hex_to_rgb(h: str):
+        h = h.lstrip("#")
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+    def lerp_hex(a: str, b: str, u: float) -> str:
+        ra, ga, ba = hex_to_rgb(a)
+        rb, gb, bb = hex_to_rgb(b)
+        return "#{:02x}{:02x}{:02x}".format(
+            int(ra + (rb - ra) * u),
+            int(ga + (gb - ga) * u),
+            int(ba + (bb - ba) * u),
+        )
+
+    def color_ramp(t: float) -> float:
+        # Colors start revealing after the split is mostly done.
+        u = (t - 0.55) / 0.45
+        if u <= 0:
+            return 0.0
+        if u >= 1:
+            return 1.0
+        return u * u * (3 - 2 * u)
+
+    def red_ramp(t: float) -> float:
+        # Fallers turn red only in the final tail of the animation.
+        u = (t - 0.85) / 0.15
+        if u <= 0:
+            return 0.0
+        if u >= 1:
+            return 1.0
+        return u * u * (3 - 2 * u)
+
+    left_text_final = [
+        (f"{s} ({r})" if s in highlight else "")
+        for s, r in zip(df["state"], df["rank_total"])
+    ]
+    right_text_final = [
+        (f"{s} ({r})" if s in highlight else "")
+        for s, r in zip(df["state"], df["rank_pc"])
+    ]
+    empty_text = [""] * n
+    marker_colors = [color_map[b] for b in df["bucket"]]
+    customdata = np.stack(
+        [df["state"], df["rank_total"], df["rank_pc"],
+         df["gdp"] / 1e9, df["gdp_per_capita"]], axis=-1
+    )
+    hover_tmpl = (
+        "<b>%{customdata[0]}</b><br>"
+        "Total GDP rank: %{customdata[1]}<br>"
+        "GDP per capita rank: %{customdata[2]}<br>"
+        "2023 GDP: $%{customdata[3]:,.0f}B<br>"
+        "GDP per capita: $%{customdata[4]:,.0f}<extra></extra>"
+    )
+
+    fig = go.Figure()
+    # Lines — start collapsed at the center, anchored on total-GDP rank on both ends.
+    for _, row in df.iterrows():
+        fig.add_trace(
+            go.Scatter(
+                x=[X_CENTER, X_CENTER],
+                y=[row["rank_total"], row["rank_total"]],
+                mode="lines",
+                line=dict(color=NEUTRAL, width=width_map[row["bucket"]]),
+                opacity=0.6,
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+    # Left marker column (starts at center, total-GDP ranks)
+    fig.add_trace(
+        go.Scatter(
+            x=[X_CENTER] * n,
+            y=df["rank_total"],
+            mode="markers+text",
+            marker=dict(size=7, color=[NEUTRAL] * n, line=dict(width=0)),
+            text=empty_text,
+            textposition="middle left",
+            textfont=dict(size=10, color=COLORS["ink"]),
+            customdata=customdata,
+            hovertemplate=hover_tmpl,
+            showlegend=False,
+        )
+    )
+    # Right marker column (starts at center, total-GDP ranks — merged with left).
+    fig.add_trace(
+        go.Scatter(
+            x=[X_CENTER] * n,
+            y=df["rank_total"],
+            mode="markers+text",
+            marker=dict(size=7, color=[NEUTRAL] * n, line=dict(width=0)),
+            text=empty_text,
+            textposition="middle right",
+            textfont=dict(size=10, color=COLORS["ink"]),
+            customdata=customdata,
+            hovertemplate=hover_tmpl,
+            showlegend=False,
+        )
+    )
+
+    legend_items = [
+        ("Rises on per-capita", COLORS["blue"]),
+        ("Falls on per-capita", COLORS["red"]),
+        ("Other states", "#c8c8c8"),
+    ]
+    for label, color in legend_items:
+        fig.add_trace(
+            go.Scatter(
+                x=[None], y=[None], mode="lines",
+                line=dict(color=color, width=3),
+                name=label,
+            )
+        )
+
+    # Arrow callouts for the 4 highlighted states in the pre-reveal state.
+    arrow_side = {"Texas": "left", "Florida": "right",
+                  "Massachusetts": "left", "Connecticut": "right",
+                  "Louisiana": "left", "Wyoming": "right"}
+    arrow_states = []
+    for st in ["Texas", "Massachusetts", "Florida", "Connecticut", "Louisiana", "Wyoming"]:
+        sel = df[df["state"] == st]
+        if not sel.empty:
+            row = sel.iloc[0]
+            side = arrow_side.get(st, "left")
+            arrow_states.append(dict(
+                state=st,
+                y=int(row["rank_total"]),
+                side=side,
+                color=color_map[row["bucket"]] if row["bucket"] != "flat" else COLORS["ink"],
+            ))
+
+    # Frames — "start" collapsed, "split" fully separated, plus interpolated
+    # waypoints so the lines grow smoothly from the center outward.
+    def build_annotations(t: float):
+        left_x = X_CENTER + (X_LEFT - X_CENTER) * t
+        right_x = X_CENTER + (X_RIGHT - X_CENTER) * t
+        base = dict(
+            xref="x", yref="paper", y=-0.04,
+            xanchor="center", yanchor="top",
+            showarrow=False,
+            font=dict(size=13, color=COLORS["ink"]),
+        )
+        # Arrows fade out as expansion starts (visible for the first ~20% of t).
+        arrow_opacity = max(0.0, 1.0 - t / 0.18)
+        anns = [
+            dict(base, x=left_x, text="Rank by <b>Total GDP</b>", opacity=1),
+            dict(base, x=right_x, text="Rank by <b>GDP per capita</b>", opacity=t),
+        ]
+        for info in arrow_states:
+            ax = -70 if info["side"] == "left" else 70
+            anns.append(dict(
+                xref="x", yref="y",
+                x=X_CENTER, y=info["y"],
+                text=f"<b>{info['state']}</b>",
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=1.1,
+                arrowwidth=1.4,
+                arrowcolor=info["color"],
+                ax=ax, ay=0,
+                xanchor="right" if info["side"] == "left" else "left",
+                yanchor="middle",
+                font=dict(size=11, color=info["color"]),
+                opacity=arrow_opacity,
+                bgcolor="rgba(251,251,251,0.9)",
+                borderpad=2,
+            ))
+        return anns
+
+    def build_frame(t: float):
+        # t in [0, 1] — 0 = collapsed, 1 = fully split.
+        left_x = X_CENTER + (X_LEFT - X_CENTER) * t
+        right_x = X_CENTER + (X_RIGHT - X_CENTER) * t
+        c_t = color_ramp(t)
+        r_t = red_ramp(t)
+
+        def trace_color(bucket: str) -> str:
+            base = lerp_hex(NEUTRAL, color_map[bucket], c_t)
+            if bucket != "fall":
+                return base
+            return lerp_hex(base, final_color_map["fall"], r_t)
+
+        data = []
+        for _, row in df.iterrows():
+            y_right = row["rank_total"] + (row["rank_pc"] - row["rank_total"]) * t
+            line_color = trace_color(row["bucket"])
+            line_opacity = 0.6 + (opacity_map[row["bucket"]] - 0.6) * c_t
+            data.append(dict(
+                x=[left_x, right_x],
+                y=[row["rank_total"], y_right],
+                line=dict(color=line_color, width=width_map[row["bucket"]]),
+                opacity=line_opacity,
+            ))
+        right_y = [rt + (rpc - rt) * t for rt, rpc in zip(df["rank_total"], df["rank_pc"])]
+        marker_colors_t = [trace_color(b) for b in df["bucket"]]
+        data.append(dict(
+            x=[left_x] * n,
+            y=df["rank_total"].tolist(),
+            text=empty_text,
+            marker=dict(size=7, color=marker_colors_t, line=dict(width=0)),
+        ))
+        data.append(dict(
+            x=[right_x] * n,
+            y=right_y,
+            text=empty_text,
+            marker=dict(size=7, color=marker_colors_t, line=dict(width=0)),
+        ))
+        for _ in legend_items:
+            data.append(dict(x=[None], y=[None]))
+        return data
+
+    # Final split frame gets the real labels.
+    split_data = build_frame(1.0)
+    split_data[n]["text"] = left_text_final
+    split_data[n + 1]["text"] = right_text_final
+
+    # Bake cubic ease-in-out into t values; linear inter-frame transitions then
+    # produce a smooth curve without Plotly re-easing each tiny step.
+    def ease(u: float) -> float:
+        return 4 * u ** 3 if u < 0.5 else 1 - ((-2 * u + 2) ** 3) / 2
+
+    n_mid = 24
+    def make_frame(name: str, t: float, data_override=None):
+        return go.Frame(
+            name=name,
+            data=data_override if data_override is not None else build_frame(t),
+            layout=dict(annotations=build_annotations(t)),
+        )
+
+    frames = [make_frame("start", 0.0)]
+    for i in range(1, n_mid + 1):
+        u = i / (n_mid + 1)
+        frames.append(make_frame(f"mid{i - 1}", ease(u)))
+    frames.append(make_frame("split", 1.0, data_override=split_data))
+    fig.frames = frames
+
+    play_args = [
+        ["split"],
+        dict(
+            frame=dict(duration=1400, redraw=False),
+            transition=dict(duration=1400, easing="cubic-in-out"),
+            mode="immediate",
+            fromcurrent=False,
+        ),
+    ]
+    reset_args = [
+        ["start"],
+        dict(
+            frame=dict(duration=600, redraw=False),
+            transition=dict(duration=600, easing="cubic-in-out"),
+            mode="immediate",
+            fromcurrent=False,
+        ),
+    ]
+
+    fig.update_xaxes(
+        tickmode="array",
+        tickvals=[],
+        ticktext=[],
+        range=[-0.28, 1.28],
+        showgrid=False,
+        zeroline=False,
+        showticklabels=False,
+    )
+    fig.update_yaxes(
+        autorange="reversed",
+        title="Rank (1 = highest)",
+        range=[n + 1, 0],
+        showgrid=False,
+        zeroline=False,
+        tickfont=dict(size=10),
+    )
+    fig.update_layout(
+        legend=dict(orientation="h", y=1.06, x=0, yanchor="bottom"),
+        margin=dict(l=32, r=32, t=60, b=56),
+        annotations=build_annotations(0.0),
+        updatemenus=[
+            dict(
+                type="buttons",
+                direction="left",
+                showactive=False,
+                x=1.0,
+                y=1.08,
+                xanchor="right",
+                yanchor="bottom",
+                bgcolor="rgba(255,255,255,0.9)",
+                bordercolor="rgba(34,124,128,0.4)",
+                borderwidth=1,
+                pad=dict(t=4, r=10, b=4, l=10),
+                font=dict(size=11, color=COLORS["teal"]),
+                buttons=[
+                    dict(label="▶ Reveal", method="skip", args=play_args),
+                    dict(label="Reset", method="skip", args=reset_args),
+                ],
+            )
+        ],
+    )
+    fig = plot_layout(fig, height=900)
+    return fig
 
 
 def state_vs_country_gdp(latest: pd.DataFrame) -> go.Figure:
@@ -4355,27 +4811,27 @@ def make_html(
     charts = [
         (
             "1",
-            "Counties Move",
-            "Metric: county per-capita personal income indexed to the U.S. average (U.S. = 100), BEA CAINC1, 1969–2024.",
-            county_mobility_animation(county_income_panel),
-        ),
-        (
-            "2",
             "States On The World Stage",
             "Metric: 2023 nominal GDP (USD billions) for U.S. states (BEA, teal) interleaved with national economies (World Bank, gold). Log scale.",
             state_vs_country_gdp(latest),
         ),
         (
+            "2",
+            "Size Is Not Prosperity",
+            "Metric: each state's rank by total 2023 GDP (left) vs rank by 2023 GDP per capita (right). Lines falling show size-driven states; lines rising show per-capita leaders. Teal = ranks ≥8 spots higher on per-capita; red = ranks ≥8 spots lower.",
+            size_vs_per_capita_ranks(latest),
+        ),
+        (
             "3",
-            "States Differ",
-            "Metric: distribution of county Breakout Scores within each state. Breakout Score = 2020–2024 avg relative-income index minus 1969–1979 avg.",
-            state_mobility_distributions(),
+            "Counties Move",
+            "Metric: county per-capita personal income indexed to the U.S. average (U.S. = 100), BEA CAINC1, 1969–2024.",
+            county_mobility_animation(county_income_panel),
         ),
         (
             "4",
-            "Metro Lens",
-            "Metric: county Breakout Score grouped by USDA ERS 2023 Rural-Urban Continuum Code (metro vs nonmetro tiers).",
-            metro_nonmetro_lens(),
+            "Breakout Atlas",
+            "Metric: county Breakout Score mapped on 2023 county polygons (BEA CAINC1 long-run relative per-capita income change).",
+            county_breakout_atlas(show_buttons=False),
         ),
         (
             "5",
@@ -4383,20 +4839,26 @@ def make_html(
             "Metric: L1-regularized logistic regression predicting whether a county's Breakout Score is positive (it gained relative-income ground vs. 1969–79). Features were trimmed to reduce collinearity (pairs with r > 0.8 or VIF > 10 dropped). Right panel shows the standardized coefficient with a 5–95% band from 200 bootstrap resamples — overlap with zero means the effect is not stable. Note: the 1969–73 income-index coefficient is negative because counties that started high had less room to rise — that is mechanical reversion, not a causal factor. This is a descriptive fit, not a causal or out-of-sample forecast.",
             model_diagnostics(),
         ),
+    ]
+    support_charts = [
         (
-            "6",
-            "Breakout Atlas",
-            "Metric: county Breakout Score mapped on 2023 county polygons (BEA CAINC1 long-run relative per-capita income change).",
-            county_breakout_atlas(show_buttons=False),
+            "S1",
+            "States Differ",
+            "Metric: distribution of county Breakout Scores within each state. Breakout Score = 2020–2024 avg relative-income index minus 1969–1979 avg.",
+            state_mobility_distributions(),
         ),
         (
-            "7",
+            "S2",
+            "Metro Lens",
+            "Metric: county Breakout Score grouped by USDA ERS 2023 Rural-Urban Continuum Code (metro vs nonmetro tiers).",
+            metro_nonmetro_lens(),
+        ),
+        (
+            "S3",
             "Industry Signature",
             "Metric: dominant 2023 industry share of county GDP (BEA CAGDP2) plotted against Breakout Score.",
             industry_composition_lens(),
         ),
-    ]
-    support_charts = [
         (
             "A",
             "Education Gradient",
@@ -5058,6 +5520,63 @@ def make_html(
       padding: 8px;
     }}
     .focus-card-map svg {{ max-height: 100%; }}
+    .focus-card-shapes {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: rgba(34,124,128,0.04);
+      border-radius: var(--radius-sm);
+      padding: 10px 10px 8px;
+    }}
+    .focus-card-vs {{
+      font-family: "New York", Georgia, serif;
+      font-style: italic;
+      font-size: 15px;
+      color: var(--muted);
+      flex-shrink: 0;
+    }}
+    .focus-tile-group {{
+      display: flex;
+      gap: 8px;
+      flex: 1;
+      justify-content: flex-end;
+    }}
+    .focus-tile {{
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      flex-shrink: 0;
+    }}
+    .focus-tile-shape {{
+      height: 54px;
+      width: 78px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    .focus-tile-shape svg {{ max-height: 100%; max-width: 100%; }}
+    .focus-tile-label {{
+      font-size: 10.5px;
+      color: var(--ink);
+      text-align: center;
+      line-height: 1.15;
+      max-width: 84px;
+      font-weight: 600;
+    }}
+    .focus-tile-state .focus-tile-shape {{
+      height: 68px;
+      width: 96px;
+    }}
+    .focus-tile-state .focus-tile-label {{
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--teal);
+    }}
+    .focus-tile-country .focus-tile-label {{
+      color: var(--muted);
+    }}
     .focus-card-state {{
       font-family: "New York", Georgia, "Times New Roman", serif !important;
       font-size: 26px;
@@ -5668,6 +6187,87 @@ def make_html(
         const current = select ? select.value : (records[0] && records[0].fips);
         if (current) render(current, false);
       }});
+    }})();
+  </script>
+  <script>
+    (function () {{
+      const LEFT_IDX = 50;
+      const RIGHT_IDX = 51;
+      function framesByName(plot) {{
+        const frames = plot._transitionData && plot._transitionData._frames;
+        const map = {{}};
+        (frames || []).forEach(function (f) {{ map[f.name] = f; }});
+        return map;
+      }}
+      function applyText(plot, frameName, delay) {{
+        setTimeout(function () {{
+          const map = framesByName(plot);
+          const f = map[frameName];
+          if (!f) return;
+          Plotly.restyle(plot, {{ text: [f.data[LEFT_IDX].text] }}, [LEFT_IDX]);
+          Plotly.restyle(plot, {{ text: [f.data[RIGHT_IDX].text] }}, [RIGHT_IDX]);
+        }}, delay);
+      }}
+      const N_MID = 24;
+      const SPLIT_SEQUENCE = [];
+      for (let i = 0; i < N_MID; i += 1) SPLIT_SEQUENCE.push("mid" + i);
+      SPLIT_SEQUENCE.push("split");
+      const RESET_SEQUENCE = [];
+      for (let i = N_MID - 1; i >= 0; i -= 1) RESET_SEQUENCE.push("mid" + i);
+      RESET_SEQUENCE.push("start");
+      const STEP_MS = 60;
+      function playSplit(plot) {{
+        Plotly.restyle(plot, {{ text: [new Array(50).fill("")] }}, [LEFT_IDX, RIGHT_IDX]);
+        Plotly.animate(plot, SPLIT_SEQUENCE, {{
+          frame: {{ duration: STEP_MS, redraw: false }},
+          transition: {{ duration: STEP_MS, easing: "linear" }},
+          mode: "immediate",
+          fromcurrent: false
+        }});
+        applyText(plot, "split", SPLIT_SEQUENCE.length * STEP_MS + 140);
+      }}
+      function playReset(plot) {{
+        Plotly.restyle(plot, {{ text: [new Array(50).fill("")] }}, [LEFT_IDX, RIGHT_IDX]);
+        Plotly.animate(plot, RESET_SEQUENCE, {{
+          frame: {{ duration: STEP_MS, redraw: false }},
+          transition: {{ duration: STEP_MS, easing: "linear" }},
+          mode: "immediate",
+          fromcurrent: false
+        }});
+      }}
+      function attachHandlers(plot) {{
+        if (!plot || !window.Plotly) return false;
+        plot.on("plotly_buttonclicked", function (ev) {{
+          const label = ev && ev.button && ev.button.label;
+          if (!label) return;
+          if (label.indexOf("Reveal") !== -1) {{
+            Plotly.restyle(plot, {{ text: [new Array(50).fill("")] }}, [LEFT_IDX, RIGHT_IDX]);
+            Plotly.animate(plot, ["start"], {{
+              frame: {{ duration: 0, redraw: true }},
+              transition: {{ duration: 0 }},
+              mode: "immediate"
+            }});
+            setTimeout(function () {{ playSplit(plot); }}, 80);
+          }} else if (label.indexOf("Reset") !== -1) {{
+            playReset(plot);
+          }}
+        }});
+        return true;
+      }}
+      function init() {{
+        const plot = document.getElementById("story-2");
+        if (!plot) return;
+        const tryAttach = function () {{
+          if (attachHandlers(plot)) return;
+          setTimeout(tryAttach, 100);
+        }};
+        tryAttach();
+      }}
+      if (document.readyState === "loading") {{
+        document.addEventListener("DOMContentLoaded", init);
+      }} else {{
+        init();
+      }}
     }})();
   </script>
 </body>
