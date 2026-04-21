@@ -5258,11 +5258,9 @@ def build_state_focus_cards_html(latest: pd.DataFrame, state_names: list[str]) -
             </button>
             '''
         )
-    # duplicate the card set so the marquee loops seamlessly
-    doubled = "".join(cards) * 2
     return (
-        '<div class="focus-cards-carousel">'
-        f'<div class="focus-cards-track" data-focus-cards>{doubled}</div>'
+        '<div class="focus-cards-grid" data-focus-cards>'
+        f'{"".join(cards)}'
         '</div>'
     )
 
@@ -5874,13 +5872,10 @@ def world_top30_economies(latest: pd.DataFrame) -> go.Figure:
     countries["lat"] = countries["label"].map(lambda c: COUNTRY_CENTROIDS.get(c, (None, None))[0])
     countries["lon"] = countries["label"].map(lambda c: COUNTRY_CENTROIDS.get(c, (None, None))[1])
 
-    us_total = float(states["gdp_b"].sum())
-    us_row = pd.DataFrame([{
-        "label": "U.S.", "gdp_b": us_total, "kind": "Country",
-        "lat": 39.8, "lon": -98.6,
-    }])
-
-    combined = pd.concat([us_row, countries, states[["label", "gdp_b", "kind", "lat", "lon"]]], ignore_index=True)
+    # Ranking is states-against-countries directly — no aggregated U.S. row, since
+    # the point of this visual is that individual states hold their own in the
+    # global top 50.
+    combined = pd.concat([countries, states[["label", "gdp_b", "kind", "lat", "lon"]]], ignore_index=True)
     combined = combined.dropna(subset=["lat", "lon"])
     combined = combined.sort_values("gdp_b", ascending=False).reset_index(drop=True)
     combined["rank"] = combined.index + 1
@@ -6398,15 +6393,6 @@ CHART_SOURCES: dict[str, list[tuple[str, str, str, str | None]]] = {
         ("BEA", "CAGDP1 county GDP per capita", "#1463a1", "bea"),
     ],
     "5": [
-        ("BEA", "CAEMP25N target (employment CAGR, 2001→2022)", "#1463a1", "bea"),
-        ("BEA", "CAGDP1 baseline (2001 GDP / population)", "#1463a1", "bea"),
-        ("Census", "ACS 2023 county traits (education, age, migration, occupations)", "#003366", "census"),
-        ("USDA ERS", "Rural-Urban Continuum Codes, 2023", "#4a6b2a", "usda"),
-        ("NSF NCSES", "State R&D, 2006 (pre-period)", "#1f4e79", "nsf"),
-        ("Fortune", "State F500 HQ density, 2006", "#a3162b", None),
-        ("BEA", "CAGDP2 industry composition, 2001 (pre-period)", "#1463a1", "bea"),
-    ],
-    "6": [
         ("BEA", "State GDP per capita, 2006–2023 (target)", "#1463a1", "bea"),
         ("Fortune", "State Fortune 500 HQ counts, 2006–2023", "#a3162b", None),
         ("NSF NCSES", "State R&D spending, 2006–2023", "#1f4e79", "nsf"),
@@ -6495,37 +6481,31 @@ def make_html(
         (
             "1",
             "California, Texas, Florida vs World Economies",
-            "Metric: 2023/24 nominal GDP (USD). California, Texas, and Florida are shown against their three nearest-in-size national economies. Below, the world's top 50 economies — U.S. states included — plotted on a natural-earth projection. Zoom in to reveal names.",
+            "U.S. states against the world's top national economies by 2023/24 nominal GDP, on a natural-earth projection.",
             world_top30_economies(latest),
         ),
         (
             "2",
             "R&D Drives Prosperity",
-            "Metric: animated bubble chart of U.S. states from 2006–2023. X = state R&D spending ($K, log scale). Y = state GDP per capita. Bubble size = population. Bubble color = number of Fortune 500 headquarters. Press play to watch the cluster migrate up-and-to-the-right.",
+            "U.S. states, 2006–2023. X: state R&D spending. Y: state GDP per capita. Bubble size: population. Color: Fortune 500 headquarters.",
             state_bubble_animation(merged),
         ),
         (
             "3",
             "State Engines",
-            "Metric: each county's share of its state's total GDP in 2023 (BEA CAGDP1). Use the dropdown to pick a state. Top 10 counties shown plus a grey bar for all remaining counties combined.",
+            "Each county's share of its state's 2023 GDP — top 10 counties plus all remaining combined.",
             state_county_share_breakdown(county),
         ),
         (
             "4",
             "Quality of Life vs GDP per Capita",
-            "Metric: Pearson correlation between a composite Quality-of-Life index (income, poverty, education, unemployment, housing; ACS 2023) and 2024 county GDP per capita (BEA CAGDP1). Counties with ≥10k residents; the top 1% GDP/capita (oil-extraction microcounties) trimmed.",
+            "Composite quality-of-life index (ACS 2023) against 2024 county GDP per capita, counties with ≥10k residents.",
             qol_breakout_correlation_lens(),
         ),
         (
             "5",
-            "Predicting County Employment Growth",
-            "Target: log-CAGR of total county employment (BEA CAEMP25N, number of jobs), 2001→2022 (winsorized at 1st/99th pct, counties with pop ≥ 5,000). Features grouped into three families — pre-period baselines (2001 GDP/population, 1969 income index, state R&D and F500 in 2006), structural/geographic (industry mix, rural-urban continuum, Census division), and slow-moving human capital (ACS 2023 education, occupations, migration, age, housing, QoL). Random Forest (800 trees, bootstrapped, sqrt-feature split). Left panel: held-out predictions with density underlay. Right panel: permutation importance on held-out set, with ±1.96·σ whiskers from 30 shuffle repeats and direction arrows (▲▼) for Spearman sign vs. the target.",
-            county_growth_prediction(),
-        ),
-        (
-            "6",
             "Testing the Hypothesis: F500, R&D, Population",
-            "State × year panel, 2006–2023. Target: log state GDP per capita. Features split into three hypothesis levers (Fortune 500 per million residents, R&D per capita, log population) and three controls (2006 baseline log GDP/cap, 2023 bachelor's share, year). Gradient-boosted trees (XGBoost, depth-4, 600 trees) with a time-based split — train on 2006–2016, test on 2017–2023 — so the model is genuinely forecasting forward. Top panel validates the fit. Bottom panel shows SHAP contributions for 2023: each state's bar decomposes the model's predicted deviation from the panel-mean log GDP/cap into how much came from the hypothesis trio (red/gold/teal) vs. controls (greys). A state whose outperformance is dominated by the colored bars is one the hypothesis explains well.",
+            "State panel, 2006–2023. XGBoost predicts log state GDP per capita from three hypothesis levers — Fortune 500 per million residents, R&D per capita, log population — and three controls: 2006 baseline log GDP/cap, 2023 bachelor's share, and year. Bottom bars show each state's 2023 SHAP decomposition.",
             state_hypothesis_panel_shap(),
         ),
     ]
@@ -6558,26 +6538,7 @@ def make_html(
                 f'<div class="focus-only-wrap">{focus_html}</div>'
                 f'{hypothesis_html}'
             )
-        elif num == "5" and hasattr(fig, "_rf_metrics"):
-            m = fig._rf_metrics
-            metrics_card = f"""
-            <div class="rf-metrics-card">
-              <div class="rf-metrics-head">
-                <span class="rf-metrics-kicker">Random Forest</span>
-                <span class="rf-metrics-sub">800 trees · sqrt features · 25% holdout</span>
-              </div>
-              <div class="rf-metrics-grid">
-                <div class="rf-metric"><span class="rf-metric-label">Holdout R²</span><span class="rf-metric-value">{m['test_r2']:.2f}</span></div>
-                <div class="rf-metric"><span class="rf-metric-label">OOB R²</span><span class="rf-metric-value">{m['oob_r2']:.2f}</span></div>
-                <div class="rf-metric"><span class="rf-metric-label">5-fold CV R²</span><span class="rf-metric-value">{m['cv_r2']:.2f} <span class="rf-metric-pm">± {m['cv_sd']:.2f}</span></span></div>
-                <div class="rf-metric"><span class="rf-metric-label">Train R²</span><span class="rf-metric-value">{m['train_r2']:.2f}</span></div>
-                <div class="rf-metric"><span class="rf-metric-label">Counties</span><span class="rf-metric-value">{m['n']:,}</span></div>
-                <div class="rf-metric"><span class="rf-metric-label">Features</span><span class="rf-metric-value">{m['features']}</span></div>
-              </div>
-            </div>
-            """
-            plot_html = f'{metrics_card}<div class="plot-wrap">{fig_html(fig, f"story-{num}")}</div>'
-        elif num == "6" and hasattr(fig, "_panel_metrics"):
+        elif num == "5" and hasattr(fig, "_panel_metrics"):
             m = fig._panel_metrics
             metrics_card = f"""
             <div class="rf-metrics-card">
@@ -7643,36 +7604,20 @@ def make_html(
     }}
     .focus-only-wrap {{
       position: relative;
-      width: calc(100vw - 24px);
-      margin-left: calc(50% - 50vw + 12px);
-      margin-right: calc(50% - 50vw + 12px);
-      padding: 0 16px;
+      width: 100%;
       box-sizing: border-box;
     }}
-    .focus-cards-carousel {{
+    .focus-cards-grid {{
       margin-top: 22px;
-      overflow: hidden;
-      position: relative;
-      -webkit-mask-image: linear-gradient(to right, transparent 0, #000 80px, #000 calc(100% - 80px), transparent 100%);
-              mask-image: linear-gradient(to right, transparent 0, #000 80px, #000 calc(100% - 80px), transparent 100%);
-    }}
-    .focus-cards-track {{
-      display: flex;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 14px;
-      width: max-content;
-      animation: focus-marquee 180s linear infinite;
     }}
-    .focus-cards-track:hover {{
-      animation-play-state: paused;
+    @media (max-width: 1100px) {{
+      .focus-cards-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
     }}
-    @keyframes focus-marquee {{
-      from {{ transform: translateX(0); }}
-      to   {{ transform: translateX(-50%); }}
-    }}
-    @media (prefers-reduced-motion: reduce) {{
-      .focus-cards-track {{ animation: none; }}
-    }}
-    @media (max-width: 880px) {{
+    @media (max-width: 620px) {{
+      .focus-cards-grid {{ grid-template-columns: 1fr; }}
       .focus-only-wrap {{
         width: auto;
         margin-left: 0;
@@ -7684,8 +7629,8 @@ def make_html(
       display: flex;
       flex-direction: column;
       gap: 14px;
-      flex: 0 0 auto;
-      width: 280px;
+      min-width: 0;
+      width: 100%;
       padding: 18px 18px 20px;
       background: #ffffff;
       border: 1px solid rgba(23,23,23,0.12);
@@ -8124,8 +8069,7 @@ def make_html(
     <a href="#chart-2" class="mini-nav-dot" data-mini-nav="chart-2"><span class="mini-nav-label">Visual 2 · R&amp;D Drives Prosperity</span><span class="mini-nav-dot-shape"></span></a>
     <a href="#chart-3" class="mini-nav-dot" data-mini-nav="chart-3"><span class="mini-nav-label">Visual 3 · State Engines</span><span class="mini-nav-dot-shape"></span></a>
     <a href="#chart-4" class="mini-nav-dot" data-mini-nav="chart-4"><span class="mini-nav-label">Visual 4 · Quality of Life</span><span class="mini-nav-dot-shape"></span></a>
-    <a href="#chart-5" class="mini-nav-dot" data-mini-nav="chart-5"><span class="mini-nav-label">Visual 5 · Random Forest</span><span class="mini-nav-dot-shape"></span></a>
-    <a href="#chart-6" class="mini-nav-dot" data-mini-nav="chart-6"><span class="mini-nav-label">Visual 6 · Hypothesis SHAP</span><span class="mini-nav-dot-shape"></span></a>
+    <a href="#chart-5" class="mini-nav-dot" data-mini-nav="chart-5"><span class="mini-nav-label">Visual 5 · Hypothesis SHAP</span><span class="mini-nav-dot-shape"></span></a>
   </nav>
   <main class="page">
     <header style="--hero-bg: url('{bg_uri}')">
