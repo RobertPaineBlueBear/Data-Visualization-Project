@@ -7718,6 +7718,86 @@ def make_html(
         border-radius: var(--radius-sm);
       }}
     }}
+    .mini-nav {{
+      position: fixed;
+      left: 22px;
+      top: 50%;
+      transform: translateY(-50%);
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      z-index: 50;
+      pointer-events: none;
+    }}
+    .mini-nav-dot {{
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 10px;
+      width: 22px;
+      height: 22px;
+      color: var(--ink);
+      text-decoration: none;
+      pointer-events: auto;
+    }}
+    .mini-nav-dot-shape {{
+      display: block;
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: rgba(23,23,23,0.18);
+      border: 2px solid rgba(255,255,255,0.85);
+      box-shadow: 0 1px 2px rgba(0,0,0,0.12);
+      transition: background 180ms ease, transform 180ms ease, box-shadow 180ms ease;
+    }}
+    .mini-nav-dot:hover .mini-nav-dot-shape {{
+      background: var(--gold);
+      transform: scale(1.25);
+    }}
+    .mini-nav-dot.is-active .mini-nav-dot-shape {{
+      background: var(--teal);
+      transform: scale(1.45);
+      box-shadow: 0 0 0 4px rgba(34,124,128,0.18), 0 1px 2px rgba(0,0,0,0.15);
+    }}
+    .mini-nav-label {{
+      position: absolute;
+      left: 28px;
+      top: 50%;
+      transform: translateY(-50%);
+      white-space: normal;
+      max-width: 118px;
+      line-height: 1.2;
+      background: rgba(23,23,23,0.92);
+      color: #ffffff;
+      padding: 6px 9px;
+      border-radius: 6px;
+      font-family: {BODY_FONT};
+      font-size: 10.5px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      opacity: 0;
+      transition: opacity 160ms ease, transform 160ms ease;
+      pointer-events: none;
+    }}
+    .mini-nav-label::after {{
+      content: "";
+      position: absolute;
+      left: -5px;
+      top: 50%;
+      transform: translateY(-50%);
+      border-right: 5px solid rgba(23,23,23,0.92);
+      border-top: 5px solid transparent;
+      border-bottom: 5px solid transparent;
+    }}
+    .mini-nav-dot:hover .mini-nav-label,
+    .mini-nav-dot.is-active .mini-nav-label {{
+      opacity: 1;
+    }}
+    @media (max-width: 900px) {{
+      .mini-nav {{ display: none; }}
+    }}
   </style>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
   <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
@@ -7734,6 +7814,13 @@ def make_html(
       }} catch(e) {{}}
     }})();
   </script>
+  <nav class="mini-nav" aria-label="Visual navigation">
+    <a href="#chart-1" class="mini-nav-dot" data-mini-nav="chart-1"><span class="mini-nav-label">Visual 1 · World Stage</span><span class="mini-nav-dot-shape"></span></a>
+    <a href="#chart-2" class="mini-nav-dot" data-mini-nav="chart-2"><span class="mini-nav-label">Visual 2 · R&amp;D Drives Prosperity</span><span class="mini-nav-dot-shape"></span></a>
+    <a href="#chart-3" class="mini-nav-dot" data-mini-nav="chart-3"><span class="mini-nav-label">Visual 3 · State Engines</span><span class="mini-nav-dot-shape"></span></a>
+    <a href="#chart-4" class="mini-nav-dot" data-mini-nav="chart-4"><span class="mini-nav-label">Visual 4 · Quality of Life</span><span class="mini-nav-dot-shape"></span></a>
+    <a href="#chart-5" class="mini-nav-dot" data-mini-nav="chart-5"><span class="mini-nav-label">Visual 5 · Random Forest</span><span class="mini-nav-dot-shape"></span></a>
+  </nav>
   <main class="page">
     <header style="--hero-bg: url('{bg_uri}')">
       <div class="hero-eyebrow">
@@ -7783,6 +7870,41 @@ def make_html(
         {{ rootMargin: "0px 0px -12% 0px", threshold: 0.18 }}
       );
       revealTargets.forEach((target) => observer.observe(target));
+    }})();
+
+    (function () {{
+      const dots = Array.from(document.querySelectorAll("[data-mini-nav]"));
+      if (!dots.length) return;
+      const sections = dots
+        .map((d) => document.getElementById(d.dataset.miniNav))
+        .filter(Boolean);
+      if (!sections.length) return;
+      function setActive(id) {{
+        dots.forEach((d) => d.classList.toggle("is-active", d.dataset.miniNav === id));
+      }}
+      const io = new IntersectionObserver(
+        (entries) => {{
+          let best = null;
+          entries.forEach((e) => {{
+            if (e.isIntersecting && (!best || e.intersectionRatio > best.intersectionRatio)) {{
+              best = e;
+            }}
+          }});
+          if (best) setActive(best.target.id);
+        }},
+        {{ rootMargin: "-40% 0px -45% 0px", threshold: [0, 0.25, 0.5, 0.75, 1] }}
+      );
+      sections.forEach((s) => io.observe(s));
+      dots.forEach((d) => {{
+        d.addEventListener("click", (ev) => {{
+          const id = d.dataset.miniNav;
+          const target = document.getElementById(id);
+          if (!target) return;
+          ev.preventDefault();
+          target.scrollIntoView({{ behavior: "smooth", block: "start" }});
+          setActive(id);
+        }});
+      }});
     }})();
 
     (function () {{
