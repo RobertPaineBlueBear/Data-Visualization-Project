@@ -8216,6 +8216,17 @@ def make_html(
 
     {chart_sections}
 
+    <section class="viz-block" id="conclusion">
+      <div class="section-kicker">Conclusion</div>
+      <div class="section-head">
+        <h2>What the Data Tells Us</h2>
+      </div>
+      <div class="hypothesis-card">
+        <span class="hypothesis-kicker">Takeaway</span>
+        We found that population, R&amp;D spending, and Fortune 500 companies matter for predicting the GDP of states — but each state has a complex assortment of counties and stories that explain why it's kept its growth that can't be entirely explained by the metrics.
+      </div>
+    </section>
+
 {("" if not support_sections.strip() else '<section class="support-intro"><div class="section-kicker">Appendix</div><h2>Supporting Evidence</h2></section>' + support_sections)}
 
     <footer>
