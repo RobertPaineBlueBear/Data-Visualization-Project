@@ -3322,56 +3322,9 @@ def state_hypothesis_panel_shap() -> go.Figure:
         "year": "#cfcfcf",
     }
 
-    fig = make_subplots(
-        rows=2, cols=1,
-        row_heights=[0.32, 0.68],
-        subplot_titles=(
-            f"<b>Actual vs predicted</b>  ·  held-out years 2017–2023  ·  n={len(test):,}",
-            "<b>2023 SHAP decomposition</b>  ·  why each state sits above or below the 2023 cross-sectional average",
-        ),
-        vertical_spacing=0.14,
-    )
+    fig = go.Figure()
 
-    # Top panel — actual vs predicted, colored by year
-    y_tr_pred = model.predict(X_tr)
-    lo = float(min(y_all.min(), np.concatenate([y_tr_pred, y_pred_te]).min()))
-    hi = float(max(y_all.max(), np.concatenate([y_tr_pred, y_pred_te]).max()))
-    fig.add_trace(
-        go.Scatter(
-            x=y_tr, y=y_tr_pred, mode="markers",
-            marker=dict(size=6, color="#c9c9c9", line=dict(width=0), opacity=0.55),
-            name="Train (2006–2016)",
-            hovertemplate="Actual log GDP/cap: %{x:.3f}<br>Predicted: %{y:.3f}<extra>Train</extra>",
-        ),
-        row=1, col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=y_te, y=y_pred_te, mode="markers",
-            marker=dict(
-                size=9,
-                color=test["year"].values,
-                colorscale=[[0.0, COLORS["teal"]], [1.0, COLORS["gold"]]],
-                colorbar=dict(title="Test year", x=1.01, y=0.83, len=0.24, thickness=11,
-                              tickfont=dict(family=BODY_FONT, size=10, color=COLORS["ink"])),
-                line=dict(width=0.5, color="#ffffff"),
-            ),
-            customdata=np.stack([test["state"].values, test["year"].values], axis=-1),
-            hovertemplate="<b>%{customdata[0]}</b>, %{customdata[1]}<br>Actual: %{x:.3f}<br>Predicted: %{y:.3f}<extra>Test</extra>",
-            name="Test (2017–2023)",
-        ),
-        row=1, col=1,
-    )
-    fig.add_trace(
-        go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines",
-                   line=dict(color=COLORS["ink"], width=1.2, dash="dot"),
-                   hoverinfo="skip", showlegend=False),
-        row=1, col=1,
-    )
-
-    # Bottom panel — stacked SHAP bars per state (2023)
     state_order = show["state"].tolist()
-    # Legend ordering: hypothesis trio first, then controls
     feature_order = hypothesis_cols + control_cols
     for feat in feature_order:
         fig.add_trace(
@@ -3383,43 +3336,43 @@ def state_hypothesis_panel_shap() -> go.Figure:
                 hovertemplate="<b>%{y}</b><br>" + pretty[feat] + ": %{x:+.3f} log units<extra></extra>",
                 legendgroup="hypothesis" if feat in hypothesis_cols else "controls",
                 legendgrouptitle_text=("<b>Hypothesis</b>" if feat in hypothesis_cols else "<b>Controls</b>"),
-            ),
-            row=2, col=1,
+            )
         )
 
-    # Vertical zero reference
-    fig.add_vline(x=0, line=dict(color=COLORS["ink"], width=1.1), row=2, col=1)
+    fig.add_vline(x=0, line=dict(color=COLORS["ink"], width=1.1))
 
-    fig.update_xaxes(title="Actual log GDP per capita", row=1, col=1, zeroline=False)
-    fig.update_yaxes(title="Predicted log GDP per capita", row=1, col=1, zeroline=False)
     fig.update_xaxes(
         title="SHAP contribution (log GDP/cap above or below the 2023 cross-sectional mean)",
-        row=2, col=1, zeroline=False,
+        zeroline=False,
     )
     fig.update_yaxes(
         categoryorder="array", categoryarray=state_order,
-        tickfont=dict(family=BODY_FONT, size=11, color=COLORS["ink"]),
-        automargin=True, row=2, col=1,
+        tickfont=dict(family=BODY_FONT, size=12, color=COLORS["ink"]),
+        automargin=True,
     )
 
     fig.update_layout(
         barmode="relative",
+        title=dict(
+            text="<b>2023 SHAP decomposition</b>  ·  why each state sits above or below the 2023 cross-sectional average",
+            x=0.0, xanchor="left",
+            font=dict(family=BODY_FONT, size=15, color=COLORS["ink"]),
+        ),
         legend=dict(
-            orientation="v", yanchor="top", y=0.62, xanchor="left", x=1.02,
+            orientation="v", yanchor="top", y=0.98, xanchor="left", x=1.02,
             bgcolor="rgba(255,255,255,0.92)", bordercolor=COLORS["ink"], borderwidth=1,
             font=dict(family=BODY_FONT, size=11, color=COLORS["ink"]),
             groupclick="toggleitem",
         ),
-        margin=dict(l=120, r=180, t=64, b=96),
+        margin=dict(l=120, r=180, t=84, b=110),
     )
 
     fig.add_annotation(
-        x=0.0, y=1.06, xref="paper", yref="paper", xanchor="left",
+        x=0.0, y=-0.09, xref="paper", yref="paper", xanchor="left",
         text=(
             f"Panel: 50 states × 18 years, 2006–2023 (n={len(panel):,}). "
-            f"Target: log real GDP per capita. XGBoost, depth-4 · 600 trees · time-based split (train ≤2016, test ≥2017). "
-            "Bottom panel shows 2023 SHAP contributions centered by each feature's 2023 cross-sectional mean — "
-            "so bars show how much each state deviates from the 2023 average. Sum of a state's bars = predicted log GDP/cap minus the 2023 mean prediction."
+            "Target: log real GDP per capita. XGBoost depth-4 · 600 trees · time-based split (train ≤2016, test ≥2017). "
+            "SHAP contributions centered by each feature's 2023 cross-sectional mean — bars show deviation from the 2023 average."
         ),
         showarrow=False, align="left",
         font=dict(family=BODY_FONT, size=12, color=COLORS["muted"]),
@@ -3435,7 +3388,7 @@ def state_hypothesis_panel_shap() -> go.Figure:
         years_train="2006–2016",
         years_test="2017–2023",
     )
-    return plot_layout(fig, height=1320)
+    return plot_layout(fig, height=900)
 
 
 def state_human_capital_scatter(latest: pd.DataFrame) -> go.Figure:
