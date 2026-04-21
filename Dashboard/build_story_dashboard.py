@@ -3297,14 +3297,20 @@ def state_hypothesis_panel_shap() -> go.Figure:
     shap_df["year"] = panel["year"].values
 
     latest = shap_df[shap_df["year"] == 2023].copy()
+    # Center each SHAP column by its 2023 cross-sectional mean. After centering,
+    # sum(centered_SHAP_i) = state's prediction − 2023 mean prediction, so the
+    # stacked bars show pure deviation from the 2023 average. This also zeroes
+    # out `year` (identical across all 2023 rows) and neutralizes the shared
+    # level-shift from the 2006 baseline, making the hypothesis bars visible.
+    for c in use_cols:
+        latest[c] = latest[c] - latest[c].mean()
     latest["hypothesis_sum"] = latest[hypothesis_cols].sum(axis=1)
     latest["control_sum"] = latest[control_cols].sum(axis=1)
-    latest["predicted_log"] = base_value + latest["hypothesis_sum"] + latest["control_sum"]
-    # Sort by predicted deviation from base (i.e. model's explanation of outperformance)
-    latest = latest.sort_values("predicted_log", ascending=False).reset_index(drop=True)
+    latest["predicted_deviation"] = latest["hypothesis_sum"] + latest["control_sum"]
+    latest = latest.sort_values("predicted_deviation", ascending=False).reset_index(drop=True)
     # Top 20 + bottom 10 for readability
     show = pd.concat([latest.head(20), latest.tail(10)], ignore_index=True).drop_duplicates(subset=["state"])
-    show = show.sort_values("predicted_log", ascending=True).reset_index(drop=True)  # bottom→top for horizontal bars
+    show = show.sort_values("predicted_deviation", ascending=True).reset_index(drop=True)  # bottom→top for horizontal bars
 
     # SHAP feature colors
     shap_colors = {
@@ -3321,7 +3327,7 @@ def state_hypothesis_panel_shap() -> go.Figure:
         row_heights=[0.32, 0.68],
         subplot_titles=(
             f"<b>Actual vs predicted</b>  ·  held-out years 2017–2023  ·  n={len(test):,}",
-            "<b>2023 SHAP decomposition</b>  ·  why each state sits above or below the panel average",
+            "<b>2023 SHAP decomposition</b>  ·  why each state sits above or below the 2023 cross-sectional average",
         ),
         vertical_spacing=0.14,
     )
@@ -3387,7 +3393,7 @@ def state_hypothesis_panel_shap() -> go.Figure:
     fig.update_xaxes(title="Actual log GDP per capita", row=1, col=1, zeroline=False)
     fig.update_yaxes(title="Predicted log GDP per capita", row=1, col=1, zeroline=False)
     fig.update_xaxes(
-        title="SHAP contribution (log GDP/cap above or below panel mean)",
+        title="SHAP contribution (log GDP/cap above or below the 2023 cross-sectional mean)",
         row=2, col=1, zeroline=False,
     )
     fig.update_yaxes(
@@ -3412,8 +3418,8 @@ def state_hypothesis_panel_shap() -> go.Figure:
         text=(
             f"Panel: 50 states × 18 years, 2006–2023 (n={len(panel):,}). "
             f"Target: log real GDP per capita. XGBoost, depth-4 · 600 trees · time-based split (train ≤2016, test ≥2017). "
-            f"Base value = panel mean log GDP/cap = {base_value:.2f}. Bars show SHAP contributions; "
-            "sum of all bars + base value = model's predicted log GDP/cap for that state in 2023."
+            "Bottom panel shows 2023 SHAP contributions centered by each feature's 2023 cross-sectional mean — "
+            "so bars show how much each state deviates from the 2023 average. Sum of a state's bars = predicted log GDP/cap minus the 2023 mean prediction."
         ),
         showarrow=False, align="left",
         font=dict(family=BODY_FONT, size=12, color=COLORS["muted"]),
