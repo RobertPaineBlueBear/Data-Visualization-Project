@@ -3391,6 +3391,170 @@ def state_hypothesis_panel_shap() -> go.Figure:
     return plot_layout(fig, height=900)
 
 
+def state_hypothesis_growth_cross_section() -> go.Figure:
+    """Cross-sectional OLS testing the same hypothesis as a growth model.
+
+    Design:
+      - Target: annualized log growth in state GDP per capita, 2006 → 2023.
+      - Features measured at 2006 only (no temporal leakage):
+          * f500_per_million_2006  (hypothesis)
+          * rd_per_capita_2006     (hypothesis)
+          * log_population_2006    (hypothesis: scale)
+          * log_gdp_per_capita_2006 (control / starting wealth — absorbs
+            resource-economy level effects like Alaska/Wyoming)
+      - Standardized OLS: each feature z-scored. Coefficients come out in
+        (log-growth per std-unit), so contribution_j = coef_j · z_ij is a
+        direct per-state, per-feature growth attribution in log points/yr.
+      - Visual: horizontal stacked bars, one per state, in the same visual
+        language as the SHAP level model.
+    """
+    panel_path = CLEAN / "merged_data.csv"
+    if not panel_path.exists():
+        fig = go.Figure()
+        fig.add_annotation(text="merged_data.csv missing.", showarrow=False, x=0.5, y=0.5)
+        return plot_layout(fig, height=620)
+
+    panel = pd.read_csv(panel_path)
+    panel = panel[panel["state"] != "District of Columbia"].copy()
+
+    y0 = panel[panel["year"] == 2006].set_index("state")
+    y1 = panel[panel["year"] == 2023].set_index("state")
+    common = y0.index.intersection(y1.index)
+    y0 = y0.loc[common]
+    y1 = y1.loc[common]
+
+    years = 2023 - 2006
+    df = pd.DataFrame(index=common)
+    df["state"] = common
+    df["f500_per_million_2006"] = y0["f500_count"] / (y0["population"] / 1e6)
+    df["rd_per_capita_2006"] = y0["research_spending"] * 1000 / y0["population"]
+    df["log_population_2006"] = np.log(y0["population"].clip(lower=1))
+    df["log_gdp_per_capita_2006"] = np.log(y0["gdp_per_capita"].clip(lower=1))
+    df["growth_2006_2023"] = (
+        np.log(y1["gdp_per_capita"].clip(lower=1)) - np.log(y0["gdp_per_capita"].clip(lower=1))
+    ) / years
+    df = df.dropna()
+
+    hypothesis_cols = ["f500_per_million_2006", "rd_per_capita_2006", "log_population_2006"]
+    control_cols = ["log_gdp_per_capita_2006"]
+    use_cols = hypothesis_cols + control_cols
+    pretty = {
+        "f500_per_million_2006": "F500 per million (2006)",
+        "rd_per_capita_2006": "R&D per capita (2006)",
+        "log_population_2006": "Log population (2006)",
+        "log_gdp_per_capita_2006": "Log GDP/cap, 2006 (baseline)",
+    }
+
+    X = df[use_cols].values.astype(float)
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0, ddof=0)
+    sd[sd == 0] = 1.0
+    Z = (X - mu) / sd
+    y = df["growth_2006_2023"].values.astype(float)
+    y_mean = y.mean()
+
+    # OLS with intercept via numpy
+    Z_aug = np.column_stack([np.ones(len(Z)), Z])
+    coefs, *_ = np.linalg.lstsq(Z_aug, y, rcond=None)
+    intercept, beta = coefs[0], coefs[1:]
+
+    y_pred = Z_aug @ coefs
+    ss_res = float(np.sum((y - y_pred) ** 2))
+    ss_tot = float(np.sum((y - y_mean) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+    # Hypothesis-only model (no baseline control)
+    Z_h = Z[:, : len(hypothesis_cols)]
+    Z_h_aug = np.column_stack([np.ones(len(Z_h)), Z_h])
+    coefs_h, *_ = np.linalg.lstsq(Z_h_aug, y, rcond=None)
+    y_pred_h = Z_h_aug @ coefs_h
+    r2_h = 1.0 - float(np.sum((y - y_pred_h) ** 2)) / ss_tot if ss_tot > 0 else float("nan")
+
+    # Per-state contribution matrix (states × features). Already mean-centered
+    # because Z has column mean 0 — so bars show deviation from mean growth.
+    contrib = Z * beta[np.newaxis, :]
+    contrib_df = pd.DataFrame(contrib, columns=use_cols, index=df.index)
+    contrib_df["state"] = df["state"].values
+    contrib_df["actual_growth"] = y
+    contrib_df["fitted_growth"] = y_pred
+    contrib_df["fitted_deviation"] = y_pred - y_mean
+
+    contrib_df = contrib_df.sort_values("fitted_deviation", ascending=False).reset_index(drop=True)
+    show = pd.concat([contrib_df.head(20), contrib_df.tail(10)], ignore_index=True).drop_duplicates(subset=["state"])
+    show = show.sort_values("fitted_deviation", ascending=True).reset_index(drop=True)
+
+    colors = {
+        "f500_per_million_2006": COLORS["red"],
+        "rd_per_capita_2006": COLORS["gold"],
+        "log_population_2006": COLORS["teal"],
+        "log_gdp_per_capita_2006": "#8a8a8a",
+    }
+
+    fig = go.Figure()
+    state_order = show["state"].tolist()
+    for feat in use_cols:
+        # Scale to growth percentage points per year for readability.
+        fig.add_trace(
+            go.Bar(
+                y=show["state"], x=show[feat] * 100.0,
+                orientation="h",
+                name=pretty[feat],
+                marker=dict(color=colors[feat], line=dict(color="#ffffff", width=0.4)),
+                hovertemplate="<b>%{y}</b><br>" + pretty[feat] + ": %{x:+.2f} pp/yr<extra></extra>",
+                legendgroup="hypothesis" if feat in hypothesis_cols else "controls",
+                legendgrouptitle_text=("<b>Hypothesis</b>" if feat in hypothesis_cols else "<b>Controls</b>"),
+            )
+        )
+
+    fig.add_vline(x=0, line=dict(color=COLORS["ink"], width=1.1))
+
+    fig.update_xaxes(
+        title="Contribution to annualized GDP-per-capita growth, 2006–2023 (percentage points/yr above or below the 50-state mean)",
+        zeroline=False,
+        ticksuffix=" pp",
+    )
+    fig.update_yaxes(
+        categoryorder="array", categoryarray=state_order,
+        tickfont=dict(family=BODY_FONT, size=12, color=COLORS["ink"]),
+        automargin=True,
+    )
+    fig.update_layout(
+        barmode="relative",
+        title=dict(
+            text="<b>2006 → 2023 growth decomposition</b>  ·  OLS attribution using 2006 starting features (no temporal leakage)",
+            x=0.0, xanchor="left",
+            font=dict(family=BODY_FONT, size=15, color=COLORS["ink"]),
+        ),
+        legend=dict(
+            orientation="v", yanchor="top", y=0.98, xanchor="left", x=1.02,
+            bgcolor="rgba(255,255,255,0.92)", bordercolor=COLORS["ink"], borderwidth=1,
+            font=dict(family=BODY_FONT, size=11, color=COLORS["ink"]),
+            groupclick="toggleitem",
+        ),
+        margin=dict(l=120, r=180, t=84, b=110),
+    )
+    fig.add_annotation(
+        x=0.0, y=-0.09, xref="paper", yref="paper", xanchor="left",
+        text=(
+            f"Cross-section: {len(df)} states, one row each. "
+            "Target: annualized log growth of real GDP/cap, 2006→2023. "
+            "Features measured at 2006 only — avoids predicting the past with the future. "
+            "OLS on standardized features; bars show each state's fitted deviation from the 50-state average growth rate."
+        ),
+        showarrow=False, align="left",
+        font=dict(family=BODY_FONT, size=12, color=COLORS["muted"]),
+    )
+
+    fig._panel_metrics_growth = dict(
+        r2=r2,
+        hyp_only_r2=r2_h,
+        n=len(df),
+        mean_growth_pp=float(y_mean) * 100.0,
+        target_years="2006–2023 (17 yrs)",
+    )
+    return plot_layout(fig, height=900)
+
+
 def state_human_capital_scatter(latest: pd.DataFrame) -> go.Figure:
     df = latest.sort_values("gdp_per_capita").copy()
     labels = set(df.head(5)["state"]) | set(df.tail(5)["state"]) | {"Texas", "California", "New York"}
@@ -6464,8 +6628,10 @@ def make_html(
         (
             "5",
             "Testing the Hypothesis: F500, R&D, Population",
-            "State panel, 2006–2023. XGBoost predicts log state GDP per capita from three hypothesis levers — Fortune 500 per million residents, R&D per capita, log population — and three controls: 2006 baseline log GDP/cap, 2023 bachelor's share, and year. Bottom bars show each state's 2023 SHAP decomposition.",
-            state_hypothesis_panel_shap(),
+            "Two models of the same hypothesis. Level view (top): why each state sits where it does in 2023. Growth view (bottom): what explains who pulled ahead 2006→2023, using 2006 starting features only.",
+            (lambda: (lambda lvl, gro: setattr(lvl, "_companion_growth", gro) or lvl)(
+                state_hypothesis_panel_shap(), state_hypothesis_growth_cross_section()
+            ))(),
         ),
     ]
     support_charts: list = []
@@ -6502,8 +6668,8 @@ def make_html(
             metrics_card = f"""
             <div class="rf-metrics-card">
               <div class="rf-metrics-head">
-                <span class="rf-metrics-kicker">XGBoost panel + SHAP</span>
-                <span class="rf-metrics-sub">50 states · 2006–2023 · time-based split</span>
+                <span class="rf-metrics-kicker">Model A · Level view (XGBoost panel + SHAP)</span>
+                <span class="rf-metrics-sub">50 states · 2006–2023 · time-based split · target: log GDP/cap in year t</span>
               </div>
               <div class="rf-metrics-grid">
                 <div class="rf-metric"><span class="rf-metric-label">Test R² ({m['years_test']})</span><span class="rf-metric-value">{m['test_r2']:.2f}</span></div>
@@ -6515,7 +6681,34 @@ def make_html(
               </div>
             </div>
             """
-            plot_html = f'{metrics_card}<div class="plot-wrap">{fig_html(fig, f"story-{num}")}</div>'
+            growth_fig = getattr(fig, "_companion_growth", None)
+            growth_block = ""
+            if growth_fig is not None:
+                g = getattr(growth_fig, "_panel_metrics_growth", {}) or {}
+                growth_metrics_card = f"""
+                <div class="rf-metrics-card">
+                  <div class="rf-metrics-head">
+                    <span class="rf-metrics-kicker">Model B · Growth view (cross-sectional OLS)</span>
+                    <span class="rf-metrics-sub">50 states · 2006 features → 2006–2023 growth · no temporal leakage</span>
+                  </div>
+                  <div class="rf-metrics-grid">
+                    <div class="rf-metric"><span class="rf-metric-label">R²</span><span class="rf-metric-value">{g.get('r2', float('nan')):.2f}</span></div>
+                    <div class="rf-metric"><span class="rf-metric-label">Hypothesis-only R²</span><span class="rf-metric-value">{g.get('hyp_only_r2', float('nan')):.2f}</span></div>
+                    <div class="rf-metric"><span class="rf-metric-label">States</span><span class="rf-metric-value">{g.get('n', 0)}</span></div>
+                    <div class="rf-metric"><span class="rf-metric-label">Mean growth</span><span class="rf-metric-value">{g.get('mean_growth_pp', float('nan')):.2f} pp/yr</span></div>
+                    <div class="rf-metric"><span class="rf-metric-label">Window</span><span class="rf-metric-value">{g.get('target_years', '')}</span></div>
+                  </div>
+                </div>
+                """
+                growth_block = (
+                    f'{growth_metrics_card}'
+                    f'<div class="plot-wrap">{fig_html(growth_fig, f"story-{num}-growth")}</div>'
+                )
+            plot_html = (
+                f'{metrics_card}'
+                f'<div class="plot-wrap">{fig_html(fig, f"story-{num}")}</div>'
+                f'{growth_block}'
+            )
         else:
             plot_html = f'<div class="plot-wrap">{fig_html(fig, f"story-{num}")}</div>'
         if is_atlas:
