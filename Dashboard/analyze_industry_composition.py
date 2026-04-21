@@ -194,6 +194,11 @@ def main() -> None:
     summary.to_csv(CLEAN / "county_industry_mobility_summary.csv", index=False)
     print(f"Wrote Clean Data/county_industry_composition.csv ({len(industry):,} rows)")
     print(f"Wrote Clean Data/county_industry_mobility_summary.csv ({len(summary):,} rows)")
+    # Pre-period (2001) snapshot for the mobility ML features — avoids leaking
+    # end-of-period composition into the growth-rate target.
+    industry_2001 = read_cagdp2(year=2001)
+    industry_2001.to_csv(CLEAN / "county_industry_composition_2001.csv", index=False)
+    print(f"Wrote Clean Data/county_industry_composition_2001.csv ({len(industry_2001):,} rows)")
 
 
 if __name__ == "__main__":

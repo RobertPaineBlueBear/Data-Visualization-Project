@@ -2737,32 +2737,61 @@ def qol_breakout_correlation_lens() -> go.Figure:
     return plot_layout(fig, height=660)
 
 
-def county_gdp_growth_prediction() -> go.Figure:
+def _load_county_employment_cagr() -> pd.DataFrame:
+    """BEA CAEMP25N LineCode 10 (Total employment, number of jobs) → annualized
+    log-CAGR per county from 2001 → 2022. Winsorized at the 1st/99th percentile
+    so a few boomtowns/busts don't dominate the fit.
+
+    The previous target (GDP-per-capita CAGR, archived in Archive/gdp_cagr_target.py)
+    mixed workplace GDP with resident population and was dominated by a few
+    oil-and-gas microcounties. Employment growth is a cleaner, more narratable
+    measure of whether a county added jobs over the period.
+    """
+    path = RAW / "CAEMP25N.zip"
+    with zipfile.ZipFile(path) as zf:
+        with zf.open("CAEMP25N__ALL_AREAS_2001_2022.csv") as f:
+            emp = pd.read_csv(f, dtype={"GeoFIPS": str}, encoding="latin1", low_memory=False)
+    emp["GeoFIPS"] = emp["GeoFIPS"].str.replace('"', "", regex=False).str.strip()
+    emp = emp[(emp["LineCode"] == 10) & (emp["GeoFIPS"].str.len() == 5) & (~emp["GeoFIPS"].str.endswith("000"))].copy()
+    emp["emp_2001"] = pd.to_numeric(emp["2001"].replace("(NA)", np.nan).replace("(D)", np.nan), errors="coerce")
+    emp["emp_2022"] = pd.to_numeric(emp["2022"].replace("(NA)", np.nan).replace("(D)", np.nan), errors="coerce")
+    emp = emp.rename(columns={"GeoFIPS": "county_fips"})
+    emp = emp[["county_fips", "emp_2001", "emp_2022"]].dropna()
+    emp = emp[(emp["emp_2001"] > 0) & (emp["emp_2022"] > 0)].copy()
+    years = 2022 - 2001
+    emp["emp_cagr_2001_2022"] = (np.log(emp["emp_2022"]) - np.log(emp["emp_2001"])) / years
+    return emp
+
+
+def county_growth_prediction() -> go.Figure:
     gdp_path = CLEAN / "county_gdp_breakouts_2001_2024.csv"
+    emp_path = RAW / "CAEMP25N.zip"
     ext_path = RAW / "acs_county_2023_extended_profile.json"
     qol_path = CLEAN / "county_quality_of_life_index.csv"
     income_path = CLEAN / "county_income_breakouts_1969_2024.csv"
     state_path = CLEAN / "merged_data.csv"
-    if not (gdp_path.exists() and ext_path.exists() and qol_path.exists() and income_path.exists() and state_path.exists()):
+    if not (gdp_path.exists() and emp_path.exists() and ext_path.exists() and qol_path.exists() and income_path.exists() and state_path.exists()):
         fig = go.Figure()
         fig.add_annotation(text="Required inputs missing.", showarrow=False, x=0.5, y=0.5)
         return plot_layout(fig, height=620)
 
+    # Pre-period baseline features still come from the GDP breakouts file
+    # (starting GDP/population/index), but the *target* is employment growth.
     raw = pd.read_csv(gdp_path, dtype={"county_fips": str})[[
         "county_fips", "bea_county_name", "state_name",
         "population_start", "gdp_per_capita_start", "gdp_index_start",
         "population_end", "gdp_per_capita_end",
     ]].copy()
-    # Research-grade target: log-ratio (annualized CAGR) of real GDP per capita 2001→2024.
-    # Using a log-ratio avoids the scale explosion of the raw index change for tiny counties.
     raw = raw[(raw["gdp_per_capita_start"] > 0) & (raw["gdp_per_capita_end"] > 0)]
-    raw = raw[raw["population_start"] >= 5_000]  # drop microcounties where a single firm dominates
-    years = 2024 - 2001
-    raw["gdp_cagr_2001_2024"] = (np.log(raw["gdp_per_capita_end"]) - np.log(raw["gdp_per_capita_start"])) / years
-    # Winsorize the target at the 1st / 99th percentile to tame remaining tails.
-    lo_q, hi_q = raw["gdp_cagr_2001_2024"].quantile([0.01, 0.99])
-    raw["gdp_cagr_2001_2024"] = raw["gdp_cagr_2001_2024"].clip(lo_q, hi_q)
-    target = raw.rename(columns={"gdp_cagr_2001_2024": "y"})
+    raw = raw[raw["population_start"] >= 5_000]
+
+    emp = _load_county_employment_cagr()
+    raw = raw.merge(emp, on="county_fips", how="inner")
+
+    # Winsorize the target at the 1st / 99th percentile to tame tails.
+    lo_q, hi_q = raw["emp_cagr_2001_2022"].quantile([0.01, 0.99])
+    raw["emp_cagr_2001_2022"] = raw["emp_cagr_2001_2022"].clip(lo_q, hi_q)
+    target = raw.rename(columns={"emp_cagr_2001_2022": "y"})
 
     with ext_path.open() as f:
         rows = json.load(f)
@@ -2813,8 +2842,15 @@ def county_gdp_growth_prediction() -> go.Figure:
     rucc["metro_flag"] = (rucc["rucc_code"] <= 3).astype(int)
     rucc = rucc[["county_fips", "rucc_code", "metro_flag"]]
 
-    # County industry composition (industry GDP shares — structural feature)
-    ind_raw = pd.read_csv(CLEAN / "county_industry_composition.csv", dtype={"county_fips": str})
+    # County industry composition (industry GDP shares — structural feature).
+    # Use the 2001 snapshot so these features are genuinely pre-period and don't
+    # leak end-of-window composition into the GDP-growth target.
+    ind_path_2001 = CLEAN / "county_industry_composition_2001.csv"
+    ind_path_default = CLEAN / "county_industry_composition.csv"
+    ind_raw = pd.read_csv(
+        ind_path_2001 if ind_path_2001.exists() else ind_path_default,
+        dtype={"county_fips": str},
+    )
     ind_raw = ind_raw.loc[:, ~ind_raw.columns.duplicated()]
     ind_cols = [
         "manufacturing_share", "mining_share", "agriculture_share",
@@ -3128,7 +3164,7 @@ def county_gdp_growth_prediction() -> go.Figure:
             row=2, col=1,
         )
 
-    fig.update_xaxes(title="Actual GDP-per-capita log-CAGR, 2001→2024", row=1, col=1, zeroline=False)
+    fig.update_xaxes(title="Actual employment log-CAGR, 2001→2022", row=1, col=1, zeroline=False)
     fig.update_yaxes(title="Predicted log-CAGR", row=1, col=1, zeroline=False)
     fig.update_xaxes(title="Permutation importance (drop in holdout R² when shuffled)", row=2, col=1, zeroline=False)
     fig.update_yaxes(automargin=True, row=2, col=1, tickfont=dict(family=BODY_FONT, size=13, color=COLORS["ink"]))
@@ -3145,7 +3181,7 @@ def county_gdp_growth_prediction() -> go.Figure:
     fig.add_annotation(
         x=0.0, y=1.06, xref="paper", yref="paper", xanchor="left",
         text=(
-            "Target: log-CAGR of real GDP per capita, 2001→2024 (1/99% winsorized). "
+            "Target: log-CAGR of total county employment (BEA CAEMP25N, number of jobs), 2001→2022 (1/99% winsorized). "
             "Counties ≥ 5,000 residents. Permutation importance on held-out 25% test set, 30 repeats; "
             "whiskers ±1.96·σ. Arrows (▲▼) show Spearman sign vs. target."
         ),
@@ -6125,12 +6161,13 @@ CHART_SOURCES: dict[str, list[tuple[str, str, str, str | None]]] = {
         ("BEA", "CAGDP1 county GDP per capita", "#1463a1", "bea"),
     ],
     "5": [
-        ("BEA", "CAGDP1 target (GDP per-capita CAGR)", "#1463a1", "bea"),
+        ("BEA", "CAEMP25N target (employment CAGR, 2001→2022)", "#1463a1", "bea"),
+        ("BEA", "CAGDP1 baseline (2001 GDP / population)", "#1463a1", "bea"),
         ("Census", "ACS 2023 county traits (education, age, migration, occupations)", "#003366", "census"),
         ("USDA ERS", "Rural-Urban Continuum Codes, 2023", "#4a6b2a", "usda"),
         ("NSF NCSES", "State R&D, 2006 (pre-period)", "#1f4e79", "nsf"),
         ("Fortune", "State F500 HQ density, 2006", "#a3162b", None),
-        ("BEA", "CAGDP2 industry composition", "#1463a1", "bea"),
+        ("BEA", "CAGDP2 industry composition, 2001 (pre-period)", "#1463a1", "bea"),
     ],
 }
 
@@ -6238,9 +6275,9 @@ def make_html(
         ),
         (
             "5",
-            "Predicting County GDP Growth",
-            "Target: log-CAGR of real GDP per capita, 2001→2024 (winsorized at 1st/99th pct, counties with pop ≥ 5,000). Features grouped into three families — pre-period baselines (2001 GDP/population, 1969 income index, state R&D and F500 in 2006), structural/geographic (industry mix, rural-urban continuum, Census division), and slow-moving human capital (ACS 2023 education, occupations, migration, age, housing, QoL). Random Forest (800 trees, bootstrapped, sqrt-feature split). Left panel: held-out predictions with density underlay. Right panel: permutation importance on held-out set, with ±1.96·σ whiskers from 30 shuffle repeats and direction arrows (▲▼) for Spearman sign vs. the target.",
-            county_gdp_growth_prediction(),
+            "Predicting County Employment Growth",
+            "Target: log-CAGR of total county employment (BEA CAEMP25N, number of jobs), 2001→2022 (winsorized at 1st/99th pct, counties with pop ≥ 5,000). Features grouped into three families — pre-period baselines (2001 GDP/population, 1969 income index, state R&D and F500 in 2006), structural/geographic (industry mix, rural-urban continuum, Census division), and slow-moving human capital (ACS 2023 education, occupations, migration, age, housing, QoL). Random Forest (800 trees, bootstrapped, sqrt-feature split). Left panel: held-out predictions with density underlay. Right panel: permutation importance on held-out set, with ±1.96·σ whiskers from 30 shuffle repeats and direction arrows (▲▼) for Spearman sign vs. the target.",
+            county_growth_prediction(),
         ),
     ]
     support_charts: list = []
