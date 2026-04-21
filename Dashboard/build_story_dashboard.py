@@ -34,6 +34,7 @@ Run from the project root:
 from __future__ import annotations
 
 import base64
+import html
 import json
 import textwrap
 import warnings
@@ -42,16 +43,19 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.offline import get_plotlyjs_version
 from plotly.subplots import make_subplots
 from sklearn.cluster import KMeans
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import LogisticRegressionCV
 from sklearn.metrics import accuracy_score, roc_auc_score, silhouette_score
 from sklearn.mixture import GaussianMixture
 from sklearn.neighbors import KernelDensity
-from sklearn.model_selection import train_test_split
+from sklearn.inspection import permutation_importance
+from sklearn.model_selection import KFold, cross_val_score, train_test_split
 from sklearn.preprocessing import StandardScaler
 
 
@@ -171,7 +175,7 @@ STATE_FIPS = {
 COLORS = {
     "ink": "#171717",
     "muted": "#686868",
-    "grid": "#dedede",
+    "grid": "#cfcfcf",
     "paper": "#fbfbfb",
     "red": "#b43b45",
     "teal": "#227c80",
@@ -663,7 +667,11 @@ def plot_layout(fig: go.Figure, height: int = 560) -> go.Figure:
         font=dict(family=BODY_FONT, color=COLORS["ink"], size=13),
         title_font=dict(family=DISPLAY_FONT, size=24, color=COLORS["ink"]),
         margin=dict(l=64, r=34, t=54, b=64),
-        hoverlabel=dict(bgcolor="#ffffff", bordercolor=COLORS["grid"], font_size=13),
+        hoverlabel=dict(
+            bgcolor="#ffffff",
+            bordercolor=COLORS["ink"],
+            font=dict(family=BODY_FONT, color=COLORS["ink"], size=13),
+        ),
     )
     fig.update_xaxes(
         showgrid=True,
@@ -671,6 +679,8 @@ def plot_layout(fig: go.Figure, height: int = 560) -> go.Figure:
         zeroline=False,
         ticks="outside",
         linecolor=COLORS["ink"],
+        tickfont=dict(family=BODY_FONT, color=COLORS["ink"], size=12),
+        title_font=dict(family=BODY_FONT, color=COLORS["ink"], size=13),
         mirror=False,
     )
     fig.update_yaxes(
@@ -679,6 +689,8 @@ def plot_layout(fig: go.Figure, height: int = 560) -> go.Figure:
         zeroline=False,
         ticks="outside",
         linecolor=COLORS["ink"],
+        tickfont=dict(family=BODY_FONT, color=COLORS["ink"], size=12),
+        title_font=dict(family=BODY_FONT, color=COLORS["ink"], size=13),
         mirror=False,
     )
     return fig
@@ -2519,11 +2531,11 @@ def volatility_vs_breakout_lens() -> go.Figure:
 
 def qol_breakout_correlation_lens() -> go.Figure:
     qol_path = CLEAN / "county_quality_of_life_index.csv"
-    mobility_path = CLEAN / "county_mobility_ml_dataset.csv"
-    if not qol_path.exists() or not mobility_path.exists():
+    gdp_path = CLEAN / "county_gdp_breakouts_2001_2024.csv"
+    if not qol_path.exists() or not gdp_path.exists():
         fig = go.Figure()
         fig.add_annotation(
-            text="Run Dashboard/build_story_dashboard.py and Dashboard/analyze_county_mobility.py to generate QoL-breakout correlation inputs.",
+            text="Run Dashboard/build_story_dashboard.py to generate QoL and county GDP inputs.",
             showarrow=False,
             x=0.5,
             y=0.5,
@@ -2531,65 +2543,100 @@ def qol_breakout_correlation_lens() -> go.Figure:
         return plot_layout(fig, height=520)
 
     qol = pd.read_csv(qol_path, dtype={"county_fips": str})
-    mobility = pd.read_csv(
-        mobility_path,
+    gdp = pd.read_csv(
+        gdp_path,
         dtype={"county_fips": str},
         usecols=[
             "county_fips",
             "bea_county_name",
             "state_name",
-            "mobility_5yr_avg",
-            "population_2024",
-            "income_index_1969_1973",
-            "income_index_2020_2024",
+            "gdp_per_capita_end",
+            "population_end",
         ],
     )
-    df = mobility.merge(
+    df = gdp.merge(
         qol[["county_fips", "qol_score_0_100", "qol_tier", "qol_components_used"]],
         on="county_fips",
         how="inner",
     )
     df = df.replace([np.inf, -np.inf], np.nan).dropna(
-        subset=["mobility_5yr_avg", "qol_score_0_100", "population_2024"]
+        subset=["gdp_per_capita_end", "qol_score_0_100", "population_end"]
     )
+    df = df[(df["gdp_per_capita_end"] > 0) & (df["population_end"] >= 10_000)]
+    # Winsorize GDP/capita top at 99th pct to keep oil-extraction microcounties from dominating the axis.
+    hi = df["gdp_per_capita_end"].quantile(0.99)
+    df = df[df["gdp_per_capita_end"] <= hi]
     if len(df) < 30:
         fig = go.Figure()
         fig.add_annotation(
-            text="Not enough joined county records to estimate QoL-breakout correlation.",
+            text="Not enough joined county records to estimate QoL-GDP correlation.",
             showarrow=False,
             x=0.5,
             y=0.5,
         )
         return plot_layout(fig, height=520)
 
-    pearson_r = df["qol_score_0_100"].corr(df["mobility_5yr_avg"])
-    spearman_rho = df["qol_score_0_100"].corr(df["mobility_5yr_avg"], method="spearman")
+    pearson_r = df["qol_score_0_100"].corr(df["gdp_per_capita_end"])
+    spearman_rho = df["qol_score_0_100"].corr(df["gdp_per_capita_end"], method="spearman")
 
-    fig = go.Figure()
+    fig = make_subplots(
+        rows=2, cols=2,
+        row_heights=[0.18, 0.82],
+        column_widths=[0.84, 0.16],
+        horizontal_spacing=0.02,
+        vertical_spacing=0.02,
+        shared_xaxes=True,
+        shared_yaxes=True,
+    )
+
+    # Top marginal: QoL distribution
+    fig.add_trace(
+        go.Histogram(
+            x=df["qol_score_0_100"],
+            nbinsx=50,
+            marker=dict(color=COLORS["teal"], line=dict(width=0)),
+            opacity=0.75,
+            hovertemplate="QoL %{x:.0f}<br>%{y} counties<extra></extra>",
+            showlegend=False,
+        ),
+        row=1, col=1,
+    )
+    # Right marginal: GDP/capita distribution
+    fig.add_trace(
+        go.Histogram(
+            y=df["gdp_per_capita_end"],
+            nbinsy=50,
+            marker=dict(color=COLORS["gold"], line=dict(width=0)),
+            opacity=0.75,
+            hovertemplate="$%{y:,.0f}<br>%{x} counties<extra></extra>",
+            showlegend=False,
+        ),
+        row=2, col=2,
+    )
+
+    # Main scatter
     fig.add_trace(
         go.Scattergl(
             x=df["qol_score_0_100"],
-            y=df["mobility_5yr_avg"],
+            y=df["gdp_per_capita_end"],
             mode="markers",
             marker=dict(
-                size=np.clip(np.sqrt(df["population_2024"]) / 82, 4, 21),
+                size=np.clip(np.sqrt(df["population_end"]) / 82, 4, 21),
                 color=df["qol_score_0_100"],
                 colorscale=[[0.0, COLORS["red"]], [0.5, COLORS["gold"]], [1.0, COLORS["teal"]]],
                 cmin=0,
                 cmax=100,
-                opacity=0.7,
+                opacity=0.72,
                 line=dict(width=0),
-                colorbar=dict(title="QoL score"),
+                showscale=False,
             ),
             customdata=np.stack(
                 [
                     df["bea_county_name"],
                     df["state_name"],
-                    df["population_2024"],
+                    df["population_end"],
                     df["qol_tier"],
                     df["qol_components_used"],
-                    df["income_index_1969_1973"],
-                    df["income_index_2020_2024"],
                 ],
                 axis=-1,
             ),
@@ -2597,49 +2644,519 @@ def qol_breakout_correlation_lens() -> go.Figure:
                 "<b>%{customdata[0]}</b><br>"
                 "%{customdata[1]}<br>"
                 "QoL score: %{x:.1f} / 100<br>"
-                "Breakout mobility: %{y:+.1f}<br>"
+                "GDP per capita: $%{y:,.0f}<br>"
                 "Tier: %{customdata[3]}<br>"
                 "Components used: %{customdata[4]:.0f}<br>"
-                "Income index: %{customdata[5]:.1f} to %{customdata[6]:.1f}<br>"
                 "Population: %{customdata[2]:,.0f}<extra></extra>"
             ),
             name="Counties",
+            showlegend=False,
+        ),
+        row=2, col=1,
+    )
+
+    # OLS fit on the main scatter panel (xref x, yref y = subplot row=2,col=1 which is x/y1)
+    x_ols = df["qol_score_0_100"].to_numpy()
+    y_ols = df["gdp_per_capita_end"].to_numpy()
+    coef = np.polyfit(x_ols, y_ols, 1)
+    xr = np.linspace(x_ols.min(), x_ols.max(), 80)
+    yr = coef[0] * xr + coef[1]
+    fig.add_trace(
+        go.Scatter(
+            x=xr, y=yr, mode="lines",
+            line=dict(color=COLORS["ink"], width=2, dash="dash"),
+            hoverinfo="skip", showlegend=False,
+        ),
+        row=2, col=1,
+    )
+
+    # Named-county annotations: pick a few recognizable high- and low-performers.
+    highlight_names = [
+        ("San Francisco", "California"),
+        ("New York", "New York"),
+        ("Santa Clara", "California"),
+        ("Midland", "Texas"),
+        ("Teton", "Wyoming"),
+    ]
+    df_key = df.assign(_k=df["bea_county_name"].str.split(",").str[0].str.replace(" County", "", regex=False).str.strip())
+    for name, state in highlight_names:
+        sub = df_key[(df_key["_k"].str.contains(name, case=False, regex=False)) & (df_key["state_name"] == state)]
+        if sub.empty:
+            continue
+        row = sub.iloc[0]
+        fig.add_annotation(
+            x=row["qol_score_0_100"], y=row["gdp_per_capita_end"],
+            xref="x2", yref="y2",
+            text=f"<b>{name}, {STATE_ABBR.get(state, state)}</b>",
+            showarrow=True,
+            arrowhead=0, arrowcolor=COLORS["ink"], arrowwidth=1.1,
+            ax=32, ay=-24,
+            font=dict(family=BODY_FONT, size=12, color=COLORS["ink"]),
+            bgcolor="rgba(255,255,255,0.92)",
+            bordercolor=COLORS["ink"], borderwidth=0.8, borderpad=4,
         )
+
+    # Correlation card
+    fig.add_annotation(
+        x=0.02, y=0.98, xref="paper", yref="paper",
+        xanchor="left", yanchor="top",
+        text=f"<b>Pearson r = {pearson_r:+.2f}</b><br>Spearman ρ = {spearman_rho:+.2f}",
+        showarrow=False,
+        bgcolor="rgba(255,255,255,0.94)",
+        bordercolor=COLORS["ink"], borderwidth=1, borderpad=10,
+        font=dict(family=BODY_FONT, size=14, color=COLORS["ink"]),
+        align="left",
     )
-    add_ols_line(fig, df, "qol_score_0_100", "mobility_5yr_avg", "OLS fit")
-    fig.add_hline(y=0, line_color=COLORS["ink"], line_width=1, line_dash="dot")
+    fig.add_annotation(
+        x=0.02, y=-0.12, xref="paper", yref="paper",
+        text="Each point is a county (≥10k pop, top 1% GDP/capita trimmed). Marker size tracks population; dashed line is OLS.",
+        showarrow=False,
+        font=dict(family=BODY_FONT, size=12, color=COLORS["muted"]),
+        align="left",
+    )
+
+    fig.update_xaxes(showgrid=False, zeroline=False, ticks="", showticklabels=False,
+                     row=1, col=1)
+    fig.update_yaxes(showgrid=False, zeroline=False, ticks="", showticklabels=False,
+                     row=1, col=1)
+    fig.update_xaxes(showgrid=False, zeroline=False, ticks="", showticklabels=False,
+                     row=2, col=2)
+    fig.update_yaxes(showgrid=False, zeroline=False, ticks="", showticklabels=False,
+                     row=2, col=2)
+
+    fig.update_xaxes(title="County quality-of-life score (0-100 percentile)",
+                     row=2, col=1)
+    fig.update_yaxes(title="County GDP per capita, 2024 (USD)",
+                     tickprefix="$", tickformat=",.0f",
+                     row=2, col=1)
     fig.update_layout(
-        title="How strongly is county quality of life correlated with breakout?",
         showlegend=False,
+        bargap=0.05,
+        margin=dict(l=78, r=28, t=24, b=88),
     )
-    fig.update_xaxes(title="County quality-of-life score (0-100 percentile)")
-    fig.update_yaxes(title="Breakout mobility (income-index change)")
+    return plot_layout(fig, height=660)
+
+
+def county_gdp_growth_prediction() -> go.Figure:
+    gdp_path = CLEAN / "county_gdp_breakouts_2001_2024.csv"
+    ext_path = RAW / "acs_county_2023_extended_profile.json"
+    qol_path = CLEAN / "county_quality_of_life_index.csv"
+    income_path = CLEAN / "county_income_breakouts_1969_2024.csv"
+    state_path = CLEAN / "merged_data.csv"
+    if not (gdp_path.exists() and ext_path.exists() and qol_path.exists() and income_path.exists() and state_path.exists()):
+        fig = go.Figure()
+        fig.add_annotation(text="Required inputs missing.", showarrow=False, x=0.5, y=0.5)
+        return plot_layout(fig, height=620)
+
+    raw = pd.read_csv(gdp_path, dtype={"county_fips": str})[[
+        "county_fips", "bea_county_name", "state_name",
+        "population_start", "gdp_per_capita_start", "gdp_index_start",
+        "population_end", "gdp_per_capita_end",
+    ]].copy()
+    # Research-grade target: log-ratio (annualized CAGR) of real GDP per capita 2001→2024.
+    # Using a log-ratio avoids the scale explosion of the raw index change for tiny counties.
+    raw = raw[(raw["gdp_per_capita_start"] > 0) & (raw["gdp_per_capita_end"] > 0)]
+    raw = raw[raw["population_start"] >= 5_000]  # drop microcounties where a single firm dominates
+    years = 2024 - 2001
+    raw["gdp_cagr_2001_2024"] = (np.log(raw["gdp_per_capita_end"]) - np.log(raw["gdp_per_capita_start"])) / years
+    # Winsorize the target at the 1st / 99th percentile to tame remaining tails.
+    lo_q, hi_q = raw["gdp_cagr_2001_2024"].quantile([0.01, 0.99])
+    raw["gdp_cagr_2001_2024"] = raw["gdp_cagr_2001_2024"].clip(lo_q, hi_q)
+    target = raw.rename(columns={"gdp_cagr_2001_2024": "y"})
+
+    with ext_path.open() as f:
+        rows = json.load(f)
+    ext = pd.DataFrame(rows[1:], columns=rows[0]).rename(columns={
+        "DP02_0066PE": "graduate_degree_pct",
+        "DP02_0067PE": "high_school_or_higher_pct",
+        "DP02_0068PE": "bachelors_or_higher_pct",
+        "DP02_0084PE": "moved_from_different_county_pct",
+        "DP02_0094PE": "foreign_born_pct",
+        "DP02_0154PE": "broadband_pct",
+        "DP03_0009PE": "unemployment_pct",
+        "DP03_0024PE": "worked_from_home_pct",
+        "DP03_0025E": "mean_commute_minutes",
+        "DP03_0027PE": "management_science_arts_occupation_pct",
+        "DP03_0041PE": "professional_scientific_industry_pct",
+        "DP03_0062E": "median_household_income",
+        "DP03_0128PE": "poverty_pct",
+        "DP04_0089E": "median_home_value",
+        "DP05_0018E": "median_age",
+        "DP05_0001E": "acs_population",
+    })
+    acs_cols = [
+        "graduate_degree_pct", "high_school_or_higher_pct", "bachelors_or_higher_pct",
+        "moved_from_different_county_pct", "foreign_born_pct", "broadband_pct",
+        "unemployment_pct", "worked_from_home_pct", "mean_commute_minutes",
+        "management_science_arts_occupation_pct", "professional_scientific_industry_pct",
+        "median_household_income", "poverty_pct", "median_home_value", "median_age",
+        "acs_population",
+    ]
+    for c in acs_cols:
+        ext[c] = pd.to_numeric(ext[c], errors="coerce")
+        ext.loc[ext[c] < 0, c] = np.nan
+    ext["county_fips"] = ext["state"].astype(str) + ext["county"].astype(str)
+    ext = ext[["county_fips", *acs_cols]]
+
+    qol = pd.read_csv(qol_path, dtype={"county_fips": str})[["county_fips", "qol_score_0_100"]]
+
+    # 1969 baseline per-capita income index (pre-period, genuinely causal)
+    income = pd.read_csv(income_path, dtype={"county_fips": str})[[
+        "county_fips", "income_index_start", "population_start"
+    ]].rename(columns={"income_index_start": "income_index_1969", "population_start": "population_1969"})
+
+    # USDA Rural-Urban Continuum Code (2023) — county-level urbanicity
+    rucc_raw = pd.read_csv(RAW / "2023-rural-urban-continuum-codes.csv", encoding="latin-1")
+    rucc = rucc_raw[rucc_raw["Attribute"] == "RUCC_2023"][["FIPS", "Value"]].copy()
+    rucc["county_fips"] = rucc["FIPS"].astype(str).str.zfill(5)
+    rucc["rucc_code"] = pd.to_numeric(rucc["Value"], errors="coerce")
+    rucc["metro_flag"] = (rucc["rucc_code"] <= 3).astype(int)
+    rucc = rucc[["county_fips", "rucc_code", "metro_flag"]]
+
+    # County industry composition (industry GDP shares — structural feature)
+    ind_raw = pd.read_csv(CLEAN / "county_industry_composition.csv", dtype={"county_fips": str})
+    ind_raw = ind_raw.loc[:, ~ind_raw.columns.duplicated()]
+    ind_cols = [
+        "manufacturing_share", "mining_share", "agriculture_share",
+        "finance_real_estate_share", "professional_business_share",
+        "information_share", "education_health_share",
+        "leisure_hospitality_share", "government_share",
+    ]
+    ind = ind_raw[["county_fips", *ind_cols]].copy()
+    ind.columns = ["county_fips"] + [f"ind_{c}" for c in ind_cols]
+
+    # Census division — captures broad regional/institutional effects
+    CENSUS_DIVISION = {
+        "Connecticut": "New England", "Maine": "New England", "Massachusetts": "New England",
+        "New Hampshire": "New England", "Rhode Island": "New England", "Vermont": "New England",
+        "New Jersey": "Mid-Atlantic", "New York": "Mid-Atlantic", "Pennsylvania": "Mid-Atlantic",
+        "Illinois": "East North Central", "Indiana": "East North Central", "Michigan": "East North Central",
+        "Ohio": "East North Central", "Wisconsin": "East North Central",
+        "Iowa": "West North Central", "Kansas": "West North Central", "Minnesota": "West North Central",
+        "Missouri": "West North Central", "Nebraska": "West North Central",
+        "North Dakota": "West North Central", "South Dakota": "West North Central",
+        "Delaware": "South Atlantic", "Florida": "South Atlantic", "Georgia": "South Atlantic",
+        "Maryland": "South Atlantic", "North Carolina": "South Atlantic", "South Carolina": "South Atlantic",
+        "Virginia": "South Atlantic", "West Virginia": "South Atlantic", "District of Columbia": "South Atlantic",
+        "Alabama": "East South Central", "Kentucky": "East South Central",
+        "Mississippi": "East South Central", "Tennessee": "East South Central",
+        "Arkansas": "West South Central", "Louisiana": "West South Central",
+        "Oklahoma": "West South Central", "Texas": "West South Central",
+        "Arizona": "Mountain", "Colorado": "Mountain", "Idaho": "Mountain", "Montana": "Mountain",
+        "Nevada": "Mountain", "New Mexico": "Mountain", "Utah": "Mountain", "Wyoming": "Mountain",
+        "Alaska": "Pacific", "California": "Pacific", "Hawaii": "Pacific",
+        "Oregon": "Pacific", "Washington": "Pacific",
+    }
+
+    # State-level R&D and Fortune 500 from the earliest year we have (2006 — close to 2001 start)
+    state_panel = pd.read_csv(state_path)
+    state_2006 = state_panel[state_panel["year"] == 2006][["state", "research_spending", "f500_count", "population", "gdp_per_capita"]].copy()
+    state_2006["state_rd_per_capita_2006"] = state_2006["research_spending"] * 1000 / state_2006["population"]
+    state_2006["state_f500_per_million_2006"] = state_2006["f500_count"] / (state_2006["population"] / 1_000_000)
+    state_2006["state_gdp_per_capita_2006"] = state_2006["gdp_per_capita"]
+    state_2006 = state_2006.rename(columns={"state": "state_name"})[[
+        "state_name", "state_rd_per_capita_2006", "state_f500_per_million_2006", "state_gdp_per_capita_2006"
+    ]]
+
+    df = (target
+          .merge(ext, on="county_fips", how="left")
+          .merge(qol, on="county_fips", how="left")
+          .merge(income, on="county_fips", how="left")
+          .merge(rucc, on="county_fips", how="left")
+          .merge(ind, on="county_fips", how="left")
+          .merge(state_2006, on="state_name", how="left"))
+    df["census_division"] = df["state_name"].map(CENSUS_DIVISION)
+    div_dummies = pd.get_dummies(df["census_division"], prefix="div", dtype=float)
+    df = pd.concat([df, div_dummies], axis=1)
+    df = df.replace([np.inf, -np.inf], np.nan)
+
+    # Log-transform skewed features
+    df["log_population_start"] = np.log(df["population_start"].clip(lower=1))
+    df["log_gdp_per_capita_start"] = np.log(df["gdp_per_capita_start"].clip(lower=1))
+    df["log_population_1969"] = np.log(df["population_1969"].clip(lower=1))
+
+    pre_period_cols = [
+        "log_gdp_per_capita_start", "log_population_start", "gdp_index_start",
+        "log_population_1969", "income_index_1969",
+        "state_rd_per_capita_2006", "state_f500_per_million_2006", "state_gdp_per_capita_2006",
+    ]
+    structural_cols = [
+        "rucc_code", "metro_flag",
+        "ind_manufacturing_share", "ind_mining_share", "ind_agriculture_share",
+        "ind_finance_real_estate_share", "ind_professional_business_share",
+        "ind_information_share", "ind_education_health_share",
+        "ind_leisure_hospitality_share", "ind_government_share",
+    ] + div_dummies.columns.tolist()
+    # ACS 2023 features are slow-moving human capital — descriptive correlates, not strictly pre-period.
+    descriptive_cols = [
+        "bachelors_or_higher_pct", "graduate_degree_pct",
+        "management_science_arts_occupation_pct", "professional_scientific_industry_pct",
+        "foreign_born_pct", "moved_from_different_county_pct",
+        "median_age", "unemployment_pct", "poverty_pct", "median_home_value", "qol_score_0_100",
+    ]
+    use_cols = pre_period_cols + structural_cols + descriptive_cols
+    df = df.dropna(subset=["y"]).copy()
+    for c in use_cols:
+        med = df[c].median()
+        df[c] = df[c].fillna(med)
+
+    pretty = {
+        "log_gdp_per_capita_start": "Log GDP per capita (2001, baseline)",
+        "log_population_start": "Log population (2001, baseline)",
+        "gdp_index_start": "GDP-per-capita index (2001, baseline)",
+        "log_population_1969": "Log population (1969)",
+        "income_index_1969": "Per-capita income index (1969)",
+        "state_rd_per_capita_2006": "State R&D per capita (2006)",
+        "state_f500_per_million_2006": "State Fortune 500 per million (2006)",
+        "state_gdp_per_capita_2006": "State GDP per capita (2006)",
+        "bachelors_or_higher_pct": "Bachelor's degree %",
+        "graduate_degree_pct": "Graduate degree %",
+        "management_science_arts_occupation_pct": "Mgmt/science/arts jobs %",
+        "professional_scientific_industry_pct": "Prof/scientific industry %",
+        "foreign_born_pct": "Foreign-born %",
+        "moved_from_different_county_pct": "In-migration %",
+        "median_age": "Median age",
+        "unemployment_pct": "Unemployment rate",
+        "poverty_pct": "Poverty rate",
+        "median_home_value": "Median home value",
+        "qol_score_0_100": "Quality-of-life score",
+        "rucc_code": "Rural-Urban Continuum Code",
+        "metro_flag": "Metro county flag",
+        "ind_manufacturing_share": "Manufacturing GDP share",
+        "ind_mining_share": "Mining GDP share",
+        "ind_agriculture_share": "Agriculture GDP share",
+        "ind_finance_real_estate_share": "Finance/real-estate GDP share",
+        "ind_professional_business_share": "Prof/business services GDP share",
+        "ind_information_share": "Information GDP share",
+        "ind_education_health_share": "Education/health GDP share",
+        "ind_leisure_hospitality_share": "Leisure/hospitality GDP share",
+        "ind_government_share": "Government GDP share",
+        "div_New England": "Division: New England",
+        "div_Mid-Atlantic": "Division: Mid-Atlantic",
+        "div_East North Central": "Division: East North Central",
+        "div_West North Central": "Division: West North Central",
+        "div_South Atlantic": "Division: South Atlantic",
+        "div_East South Central": "Division: East South Central",
+        "div_West South Central": "Division: West South Central",
+        "div_Mountain": "Division: Mountain",
+        "div_Pacific": "Division: Pacific",
+    }
+
+    # Feature → category map (for grouping + colors)
+    FEATURE_CATEGORY = {}
+    for c in pre_period_cols:
+        FEATURE_CATEGORY[c] = "Pre-period baseline"
+    for c in structural_cols:
+        FEATURE_CATEGORY[c] = "Structural / geographic"
+    for c in descriptive_cols:
+        FEATURE_CATEGORY[c] = "Human capital (ACS 2023)"
+    CATEGORY_COLORS = {
+        "Pre-period baseline": COLORS["teal"],
+        "Structural / geographic": COLORS["gold"],
+        "Human capital (ACS 2023)": COLORS["red"],
+    }
+
+    X = df[use_cols].values
+    y = df["y"].values
+    X_tr, X_te, y_tr, y_te, idx_tr, idx_te = train_test_split(
+        X, y, np.arange(len(df)), test_size=0.25, random_state=42
+    )
+    # Random Forest — nonparametric, handles nonlinearity and interactions, OOB gives a free generalization check.
+    model = RandomForestRegressor(
+        n_estimators=800,
+        max_features="sqrt",
+        min_samples_leaf=8,
+        max_depth=None,
+        oob_score=True,
+        bootstrap=True,
+        n_jobs=-1,
+        random_state=42,
+    )
+    model.fit(X_tr, y_tr)
+    y_pred_te = model.predict(X_te)
+    test_r2 = float(1 - np.sum((y_te - y_pred_te) ** 2) / np.sum((y_te - y_te.mean()) ** 2))
+    train_r2 = float(model.score(X_tr, y_tr))
+    oob_r2 = float(model.oob_score_)
+
+    # 5-fold CV for a stable generalization estimate (same hyperparameters)
+    cv_model = RandomForestRegressor(
+        n_estimators=500, max_features="sqrt", min_samples_leaf=8,
+        bootstrap=True, n_jobs=-1, random_state=42,
+    )
+    cv_scores = cross_val_score(
+        cv_model, X, y, cv=KFold(n_splits=5, shuffle=True, random_state=42),
+        scoring="r2", n_jobs=-1,
+    )
+    cv_r2 = float(cv_scores.mean())
+    cv_sd = float(cv_scores.std())
+
+    # Permutation importance on the holdout, many repeats → CI whiskers
+    N_REPEATS = 30
+    perm = permutation_importance(
+        model, X_te, y_te, n_repeats=N_REPEATS, random_state=42, n_jobs=-1
+    )
+    # Direction sign via Spearman correlation with target (full sample)
+    signs = {}
+    for c in use_cols:
+        try:
+            s = pd.Series(df[c]).rank().corr(pd.Series(df["y"]).rank())
+            signs[c] = "+" if s >= 0 else "−"
+        except Exception:
+            signs[c] = " "
+
+    imp_rows = []
+    for c, mean, std in zip(use_cols, perm.importances_mean, perm.importances_std):
+        imp_rows.append({
+            "feature_raw": c,
+            "feature": pretty.get(c, c),
+            "category": FEATURE_CATEGORY.get(c, "Other"),
+            "importance": float(mean),
+            "importance_sd": float(std),
+            "direction": signs.get(c, " "),
+        })
+    importances = pd.DataFrame(imp_rows)
+    importances = importances.sort_values("importance", ascending=True).tail(15).copy()
+    # Label with an arrow glyph on direction
+    importances["feature_display"] = importances.apply(
+        lambda r: f"{'▲' if r['direction']=='+' else '▼'}  {r['feature']}", axis=1
+    )
+
+    df_te = df.iloc[idx_te].copy()
+    df_te["predicted"] = y_pred_te
+    df_te["actual"] = y_te
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        row_heights=[0.46, 0.54],
+        subplot_titles=(
+            f"<b>Actual vs predicted</b>  ·  holdout n={len(df_te):,}",
+            "<b>Top 15 predictors</b>  ·  permutation importance on holdout",
+        ),
+        vertical_spacing=0.12,
+    )
+
+    # LEFT PANEL — density + scatter + perfect-prediction diagonal
+    lo = float(min(df_te["actual"].min(), df_te["predicted"].min()))
+    hi = float(max(df_te["actual"].max(), df_te["predicted"].max()))
+    # Density heatmap underneath
+    fig.add_trace(
+        go.Histogram2d(
+            x=df_te["actual"], y=df_te["predicted"],
+            nbinsx=40, nbinsy=40,
+            colorscale=[[0, "rgba(255,255,255,0)"], [0.15, "#f3e9d8"], [0.5, "#e0c68e"], [1.0, COLORS["gold"]]],
+            showscale=False, opacity=0.55, zmin=0,
+        ),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scattergl(
+            x=df_te["actual"], y=df_te["predicted"], mode="markers",
+            marker=dict(
+                size=np.clip(np.sqrt(df_te["population_end"].fillna(1e4)) / 110, 3, 14),
+                color=df_te["actual"] - df_te["predicted"],
+                colorscale=[[0.0, COLORS["red"]], [0.5, "#b0b0b0"], [1.0, COLORS["teal"]]],
+                cmid=0, opacity=0.55, line=dict(width=0),
+            ),
+            customdata=np.stack([df_te["bea_county_name"], df_te["state_name"], df_te["population_end"].fillna(0)], axis=-1),
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>%{customdata[1]}<br>"
+                "Actual: %{x:+.3f}/yr<br>Predicted: %{y:+.3f}/yr<br>"
+                "2024 pop: %{customdata[2]:,.0f}<extra></extra>"
+            ),
+            name="Counties", showlegend=False,
+        ),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[lo, hi], y=[lo, hi], mode="lines",
+            line=dict(color=COLORS["ink"], width=1.4, dash="dot"),
+            hoverinfo="skip", showlegend=False,
+        ),
+        row=1, col=1,
+    )
+
+    # BOTTOM PANEL — lollipop with CI whiskers, colored by category
+    cat_colors = [CATEGORY_COLORS[c] for c in importances["category"]]
+    # Stem lines (0 → importance) drawn as individual line traces
+    for _, r in importances.iterrows():
+        fig.add_trace(
+            go.Scatter(
+                x=[0, r["importance"]], y=[r["feature_display"], r["feature_display"]],
+                mode="lines",
+                line=dict(color=CATEGORY_COLORS[r["category"]], width=2.8),
+                hoverinfo="skip", showlegend=False,
+            ),
+            row=2, col=1,
+        )
+    # CI whiskers (±1.96 σ)
+    fig.add_trace(
+        go.Scatter(
+            x=importances["importance"], y=importances["feature_display"],
+            mode="markers",
+            marker=dict(
+                size=14, color=cat_colors,
+                line=dict(color="#ffffff", width=1.4),
+            ),
+            error_x=dict(
+                type="data", array=1.96 * importances["importance_sd"],
+                thickness=1.2, width=5, color=COLORS["ink"],
+            ),
+            customdata=np.stack([importances["category"], importances["direction"], importances["importance_sd"]], axis=-1),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Importance (Δ R²): %{x:.4f}<br>"
+                "σ across %{text} repeats: %{customdata[2]:.4f}<br>"
+                "Category: %{customdata[0]}<br>"
+                "Direction vs target: %{customdata[1]}<extra></extra>"
+            ),
+            text=[str(N_REPEATS)] * len(importances),
+            showlegend=False,
+        ),
+        row=2, col=1,
+    )
+    # Vertical zero line
+    fig.add_vline(x=0, line=dict(color=COLORS["ink"], width=1), row=2, col=1)
+    # Legend for categories (dummy traces) — bigger, bolder dots
+    for cat, color in CATEGORY_COLORS.items():
+        fig.add_trace(
+            go.Scatter(
+                x=[None], y=[None], mode="markers",
+                marker=dict(size=18, color=color, line=dict(color=COLORS["ink"], width=1)),
+                name=f"<b>{cat}</b>", showlegend=True,
+            ),
+            row=2, col=1,
+        )
+
+    fig.update_xaxes(title="Actual GDP-per-capita log-CAGR, 2001→2024", row=1, col=1, zeroline=False)
+    fig.update_yaxes(title="Predicted log-CAGR", row=1, col=1, zeroline=False)
+    fig.update_xaxes(title="Permutation importance (drop in holdout R² when shuffled)", row=2, col=1, zeroline=False)
+    fig.update_yaxes(automargin=True, row=2, col=1, tickfont=dict(family=BODY_FONT, size=13, color=COLORS["ink"]))
+
+    fig.update_layout(
+        legend=dict(
+            orientation="h", yanchor="bottom", y=-0.13, xanchor="center", x=0.5,
+            bgcolor="rgba(255,255,255,0.9)", bordercolor=COLORS["ink"], borderwidth=1,
+            font=dict(family=BODY_FONT, size=13, color=COLORS["ink"]),
+            itemsizing="constant",
+        ),
+        margin=dict(l=48, r=24, t=70, b=110),
+    )
     fig.add_annotation(
-        x=0.02,
-        y=0.98,
-        xref="paper",
-        yref="paper",
-        xanchor="left",
-        yanchor="top",
-        text=f"Pearson r = {pearson_r:+.2f}<br>Spearman rho = {spearman_rho:+.2f}",
-        showarrow=False,
-        bgcolor="rgba(255,255,255,0.86)",
-        bordercolor=COLORS["grid"],
-        borderpad=6,
-        font=dict(size=12, color=COLORS["ink"]),
-        align="left",
+        x=0.0, y=1.06, xref="paper", yref="paper", xanchor="left",
+        text=(
+            "Target: log-CAGR of real GDP per capita, 2001→2024 (1/99% winsorized). "
+            "Counties ≥ 5,000 residents. Permutation importance on held-out 25% test set, 30 repeats; "
+            "whiskers ±1.96·σ. Arrows (▲▼) show Spearman sign vs. target."
+        ),
+        showarrow=False, align="left",
+        font=dict(family=BODY_FONT, size=12, color=COLORS["muted"]),
     )
-    fig.add_annotation(
-        x=0.02,
-        y=-0.18,
-        xref="paper",
-        yref="paper",
-        text="Each point is a county in the mobility model sample. Marker size tracks population; line is an OLS fit.",
-        showarrow=False,
-        font=dict(size=12, color=COLORS["muted"]),
-        align="left",
+    fig._rf_metrics = dict(
+        test_r2=test_r2, oob_r2=oob_r2, cv_r2=cv_r2, cv_sd=cv_sd,
+        train_r2=train_r2, n=len(df), features=len(use_cols),
     )
-    return plot_layout(fig, height=620)
+    return plot_layout(fig, height=960)
 
 
 def state_human_capital_scatter(latest: pd.DataFrame) -> go.Figure:
@@ -3889,6 +4406,99 @@ def metro_concentration(county: pd.DataFrame) -> go.Figure:
     return plot_layout(fig, height=520)
 
 
+def state_county_share_breakdown(county: pd.DataFrame) -> go.Figure:
+    df = county[county["state_name"].notna()].copy()
+    df = df.dropna(subset=["county_gdp_current_dollars", "acs_population"])
+    df = df[df["county_gdp_current_dollars"] > 0]
+    state_totals = df.groupby("state_name")["county_gdp_current_dollars"].sum().rename("state_gdp").reset_index()
+    df = df.merge(state_totals, on="state_name", how="left")
+    df["share_of_state_gdp_pct"] = df["county_gdp_current_dollars"] / df["state_gdp"] * 100
+
+    state_order = ["California", "Texas", "Florida", "New York", "Massachusetts", "Washington"]
+    extra = sorted(
+        s for s in df["state_name"].unique()
+        if s not in state_order and s != "District of Columbia"
+    )
+    state_order = [s for s in state_order if s in set(df["state_name"])] + extra
+
+    fig = go.Figure()
+    for state in state_order:
+        sub = df[df["state_name"] == state].copy()
+        top = sub.nlargest(10, "share_of_state_gdp_pct").copy()
+        other_share = max(0.0, 100.0 - top["share_of_state_gdp_pct"].sum())
+        other = pd.DataFrame({
+            "name": [f"All other {len(sub) - len(top)} counties"],
+            "share_of_state_gdp_pct": [other_share],
+            "county_gdp_current_dollars": [np.nan],
+            "acs_population": [np.nan],
+        })
+        plot_df = pd.concat([top[["name", "share_of_state_gdp_pct", "county_gdp_current_dollars", "acs_population"]], other])
+        plot_df = plot_df.sort_values("share_of_state_gdp_pct")
+        labels = [
+            str(name).replace(" County", "").split(",")[0].strip()
+            for name in plot_df["name"]
+        ]
+        colors = [
+            "#d9d9d9" if str(n).startswith("All other") else COLORS["teal"]
+            for n in plot_df["name"]
+        ]
+        fig.add_trace(go.Bar(
+            x=plot_df["share_of_state_gdp_pct"],
+            y=labels,
+            orientation="h",
+            marker_color=colors,
+            customdata=np.stack(
+                [plot_df["county_gdp_current_dollars"].fillna(0), plot_df["acs_population"].fillna(0)],
+                axis=-1,
+            ),
+            text=[f"{v:.1f}%" for v in plot_df["share_of_state_gdp_pct"]],
+            textposition="outside",
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Share of state GDP: %{x:.2f}%<br>"
+                "County GDP: $%{customdata[0]:,.0f}<br>"
+                "Population: %{customdata[1]:,.0f}<extra></extra>"
+            ),
+            name=state,
+            visible=(state == state_order[0]),
+            showlegend=False,
+        ))
+
+    buttons = []
+    subtitle_template = "<b>{state}</b> — each county's share of total state GDP, 2023"
+    for i, state in enumerate(state_order):
+        visible = [False] * len(state_order)
+        visible[i] = True
+        buttons.append(dict(
+            label=state, method="update",
+            args=[{"visible": visible},
+                  {"title.text": subtitle_template.format(state=state)}],
+        ))
+
+    fig.update_layout(
+        title=dict(
+            text=subtitle_template.format(state=state_order[0]),
+            font=dict(family=DISPLAY_FONT, size=22, color=COLORS["ink"]),
+            x=0.0, xanchor="left", y=0.97, yanchor="top",
+        ),
+        updatemenus=[dict(
+            type="dropdown", buttons=buttons,
+            x=1, y=1.12, xanchor="right", yanchor="top",
+            bgcolor="#ffffff", bordercolor=COLORS["ink"], borderwidth=1,
+            font=dict(family=BODY_FONT, size=13, color=COLORS["ink"]),
+        )],
+        showlegend=False,
+        bargap=0.22,
+        margin=dict(l=170, r=70, t=96, b=56),
+    )
+    fig.update_xaxes(title="Share of state GDP (%)", ticksuffix="%")
+    fig.update_yaxes(
+        title="", automargin=True,
+        tickfont=dict(family=BODY_FONT, size=14, color=COLORS["ink"]),
+    )
+    return plot_layout(fig, height=640)
+
+
 def state_engine_breakdown(county: pd.DataFrame, latest: pd.DataFrame) -> go.Figure:
     df = county[county["state_name"].notna()].copy()
     df = df.dropna(subset=["county_gdp_current_dollars", "acs_population"]).copy()
@@ -4375,7 +4985,232 @@ def build_state_focus_cards_html(latest: pd.DataFrame, state_names: list[str]) -
             </button>
             '''
         )
-    return f'<div class="focus-cards" data-focus-cards>{"".join(cards)}</div>'
+    # duplicate the card set so the marquee loops seamlessly
+    doubled = "".join(cards) * 2
+    return (
+        '<div class="focus-cards-carousel">'
+        f'<div class="focus-cards-track" data-focus-cards>{doubled}</div>'
+        '</div>'
+    )
+
+
+def hypothesis_tile_scatters(merged: pd.DataFrame, county_gdp_index: pd.DataFrame) -> go.Figure:
+    start_year, end_year = 2006, 2023
+    a = merged[(merged["year"] == start_year) & (merged["state"] != "District of Columbia")].copy()
+    b = merged[(merged["year"] == end_year) & (merged["state"] != "District of Columbia")].copy()
+    a = a.rename(columns={"gdp_per_capita": "gdp_pc_start", "population": "pop_start"})
+    b = b.rename(columns={"population": "pop_end", "f500_count": "f500_end"})
+    state_ctx = a[["state", "research_spending", "pop_start"]].merge(
+        b[["state", "pop_end", "f500_end"]], on="state"
+    )
+    state_ctx["state_f500_per_million"] = state_ctx["f500_end"] / (state_ctx["pop_end"] / 1_000_000)
+    state_ctx["state_rd_per_capita_2006"] = state_ctx["research_spending"] * 1000 / state_ctx["pop_start"]
+
+    # County panel: compute county GDP-per-capita CAGR and population growth over the available window
+    cpanel = county_gdp_index.dropna(subset=["county_gdp_per_capita", "population", "state_name"]).copy()
+    cpanel = cpanel[cpanel["state_name"] != "District of Columbia"]
+    yr_min, yr_max = int(cpanel["year"].min()), int(cpanel["year"].max())
+    start = cpanel[cpanel["year"] == yr_min][["county_fips", "state_name", "county_gdp_per_capita", "population"]].rename(
+        columns={"county_gdp_per_capita": "gdp_pc_start_c", "population": "pop_start_c"}
+    )
+    end = cpanel[cpanel["year"] == yr_max][["county_fips", "county_gdp_per_capita", "population"]].rename(
+        columns={"county_gdp_per_capita": "gdp_pc_end_c", "population": "pop_end_c"}
+    )
+    df = start.merge(end, on="county_fips")
+    df = df[(df["gdp_pc_start_c"] > 0) & (df["pop_start_c"] >= 5000)].copy()
+    years = yr_max - yr_min
+    df["breakout_cagr"] = (np.log(df["gdp_pc_end_c"]) - np.log(df["gdp_pc_start_c"])) / years * 100
+    df["pop_growth_pct"] = (df["pop_end_c"] / df["pop_start_c"] - 1) * 100
+    # winsorize breakout_cagr to keep tiny-county tails from eating the axis
+    lo, hi = np.nanpercentile(df["breakout_cagr"], [1, 99])
+    df["breakout_cagr"] = df["breakout_cagr"].clip(lo, hi)
+    df = df.merge(state_ctx[["state", "state_f500_per_million", "state_rd_per_capita_2006"]],
+                  left_on="state_name", right_on="state", how="left")
+    df = df.dropna(subset=["breakout_cagr", "pop_growth_pct", "state_f500_per_million", "state_rd_per_capita_2006"])
+
+    tiles = [
+        ("state_f500_per_million", f"State Fortune 500 HQs per million residents ({end_year})"),
+        ("pop_growth_pct", f"County population growth {yr_min} → {yr_max} (%)"),
+        ("state_rd_per_capita_2006", "State R&D spending per capita, 2006 ($)"),
+    ]
+
+    fig = make_subplots(
+        rows=1, cols=3,
+        horizontal_spacing=0.08,
+        subplot_titles=[t[1] for t in tiles],
+    )
+
+    for i, (col, _label) in enumerate(tiles, start=1):
+        x = df[col].values
+        y = df["breakout_cagr"].values
+        r = float(np.corrcoef(x, y)[0, 1])
+        slope, intercept = np.polyfit(x, y, 1)
+        xs = np.linspace(x.min(), x.max(), 50)
+        ys = slope * xs + intercept
+
+        sizes = np.clip(np.sqrt(df["pop_end_c"].values) / 90, 3, 18)
+        fig.add_trace(
+            go.Scattergl(
+                x=x, y=y, mode="markers",
+                marker=dict(
+                    size=sizes,
+                    color=y,
+                    colorscale=[[0.0, COLORS["red"]], [0.5, COLORS["gold"]], [1.0, COLORS["teal"]]],
+                    cmid=0.0,
+                    line=dict(color="rgba(255,255,255,0.35)", width=0.4),
+                    opacity=0.55,
+                ),
+                text=df["state_name"],
+                customdata=df["county_fips"],
+                hovertemplate="<b>%{customdata}</b> · %{text}<br>x: %{x:,.2f}<br>Breakout CAGR: %{y:.2f}%/yr<extra></extra>",
+                showlegend=False,
+            ),
+            row=1, col=i,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=xs, y=ys, mode="lines",
+                line=dict(color=COLORS["ink"], width=1.6, dash="dot"),
+                hoverinfo="skip", showlegend=False,
+            ),
+            row=1, col=i,
+        )
+        fig.add_annotation(
+            xref=f"x{'' if i == 1 else i} domain", yref=f"y{'' if i == 1 else i} domain", x=0.04, y=0.96, xanchor="left",
+            text=f"<b>r = {r:+.2f}</b>",
+            showarrow=False,
+            bgcolor="rgba(255,255,255,0.88)",
+            bordercolor=COLORS["grid"], borderpad=5,
+            font=dict(size=13, color=COLORS["ink"]),
+        )
+        fig.update_yaxes(title="Breakout (GDP/cap CAGR, %/yr)" if i == 1 else None, row=1, col=i)
+        if col == "state_rd_per_capita_2006":
+            fig.update_xaxes(type="log", tickprefix="$", row=1, col=i)
+        elif col == "pop_growth_pct":
+            fig.update_xaxes(ticksuffix="%", row=1, col=i)
+
+    fig.update_layout(margin=dict(l=48, r=24, t=56, b=40))
+    return plot_layout(fig, height=420)
+
+
+def state_bubble_animation(merged: pd.DataFrame) -> go.Figure:
+    df = merged[merged["state"] != "District of Columbia"].copy()
+    df = df.dropna(subset=["research_spending", "gdp_per_capita", "population", "f500_count"])
+    df = df[df["research_spending"] > 0]
+    df = df.sort_values("year")
+    df["year_str"] = df["year"].astype(int).astype(str)
+
+    fig = px.scatter(
+        df,
+        x="research_spending",
+        y="gdp_per_capita",
+        size="population",
+        color="f500_count",
+        hover_name="state",
+        animation_frame="year_str",
+        animation_group="state",
+        size_max=60,
+        color_continuous_scale=[[0.0, COLORS["red"]], [0.5, COLORS["gold"]], [1.0, COLORS["teal"]]],
+        labels={
+            "research_spending": "R&D Spending ($K)",
+            "gdp_per_capita": "GDP per Capita ($)",
+            "population": "Population",
+            "f500_count": "F500 Companies",
+            "year_str": "Year",
+        },
+    )
+    y_max = float(df["gdp_per_capita"].max()) * 1.05
+    fig.update_layout(
+        title=None,
+        xaxis=dict(
+            type="log",
+            title="R&D Spending ($K, log scale)",
+            range=[np.log10(100), np.log10(800000)],
+        ),
+        yaxis=dict(range=[25000, y_max], title="GDP per Capita ($)"),
+        coloraxis_colorbar=dict(
+            title=dict(text="F500<br>HQ", font=dict(size=12, family=BODY_FONT)),
+            x=0.995, xanchor="right",
+            y=0.5, yanchor="middle",
+            len=0.62, thickness=14,
+            bgcolor="rgba(255,255,255,0.88)",
+            bordercolor=COLORS["grid"], borderwidth=1,
+            tickfont=dict(size=11, family=BODY_FONT, color=COLORS["ink"]),
+            outlinewidth=0,
+        ),
+        margin=dict(l=64, r=28, t=28, b=96),
+    )
+    fig.update_traces(marker=dict(opacity=0.72, line=dict(width=0.6, color="white")))
+
+    # Bigger, on-brand play/pause buttons and slider
+    if fig.layout.updatemenus:
+        try:
+            fig.layout.updatemenus[0].buttons[0].args[1]["frame"]["duration"] = 900
+            fig.layout.updatemenus[0].buttons[0].args[1]["frame"]["redraw"] = True
+            fig.layout.updatemenus[0].buttons[0].args[1]["transition"]["duration"] = 400
+        except (IndexError, KeyError, TypeError):
+            pass
+        fig.update_layout(updatemenus=[dict(
+            type="buttons", direction="left",
+            x=0.02, y=-0.16, xanchor="left", yanchor="top",
+            pad=dict(t=4, r=8, b=4, l=8),
+            bgcolor="rgba(255,255,255,0.95)",
+            bordercolor=COLORS["ink"], borderwidth=1,
+            font=dict(family=BODY_FONT, size=14, color=COLORS["ink"]),
+            buttons=list(fig.layout.updatemenus[0].buttons),
+        )])
+    if fig.layout.sliders:
+        try:
+            steps = list(fig.layout.sliders[0].steps)
+            for step in steps:
+                try:
+                    step["args"][1]["frame"]["redraw"] = True
+                except (KeyError, TypeError, IndexError):
+                    pass
+            fig.update_layout(sliders=[dict(
+                active=0,
+                x=0.14, y=-0.18, len=0.82,
+                xanchor="left", yanchor="top",
+                pad=dict(t=18, b=8),
+                bgcolor="rgba(0,0,0,0.08)",
+                bordercolor="rgba(0,0,0,0)",
+                activebgcolor=COLORS["teal"],
+                tickcolor=COLORS["muted"],
+                font=dict(family=BODY_FONT, size=12, color=COLORS["ink"]),
+                currentvalue=dict(
+                    visible=True, prefix="Year: ",
+                    font=dict(family=DISPLAY_FONT, size=18, color=COLORS["ink"]),
+                    xanchor="left", offset=14,
+                ),
+                steps=steps,
+            )])
+        except (IndexError, KeyError, TypeError):
+            pass
+
+    # Per-frame big year badge in top-right of plot area
+    years = sorted(df["year_str"].unique())
+    base_year = years[0]
+
+    def year_badge(y: str) -> dict:
+        return dict(
+            x=0.04, y=0.96, xref="paper", yref="paper",
+            xanchor="left", yanchor="top",
+            text=f"<b>{y}</b>",
+            showarrow=False,
+            font=dict(family=DISPLAY_FONT, size=84, color="rgba(23,23,23,0.16)"),
+        )
+
+    fig.update_layout(annotations=[year_badge(base_year)])
+    if fig.frames:
+        new_frames = []
+        for fr in fig.frames:
+            fr_name = fr.name
+            layout_update = fr.layout.to_plotly_json() if fr.layout is not None else {}
+            layout_update["annotations"] = [year_badge(fr_name)]
+            new_frames.append(go.Frame(data=fr.data, name=fr_name, layout=layout_update))
+        fig.frames = new_frames
+
+    return plot_layout(fig, height=680)
 
 
 def size_vs_per_capita_ranks(latest: pd.DataFrame) -> go.Figure:
@@ -4683,7 +5518,7 @@ def size_vs_per_capita_ranks(latest: pd.DataFrame) -> go.Figure:
         range=[n + 1, 0],
         showgrid=False,
         zeroline=False,
-        tickfont=dict(size=10),
+        tickfont=dict(size=11),
     )
     fig.update_layout(
         legend=dict(orientation="h", y=1.06, x=0, yanchor="bottom"),
@@ -4714,58 +5549,149 @@ def size_vs_per_capita_ranks(latest: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def state_vs_country_gdp(latest: pd.DataFrame) -> go.Figure:
-    states = (
-        latest[["state", "gdp"]]
-        .dropna()
-        .assign(label=lambda d: d["state"], kind="State", gdp_b=lambda d: d["gdp"] / 1e9)
-        [["label", "gdp_b", "kind"]]
-    )
-    countries = pd.DataFrame(
-        [{"label": name, "gdp_b": float(val), "kind": "Country"} for name, val in COUNTRY_GDP_2023_BILLIONS]
-    )
-    combined = pd.concat([states, countries], ignore_index=True)
-    combined = combined.sort_values("gdp_b", ascending=True).reset_index(drop=True)
-    order = combined["label"].tolist()
+STATE_CENTROIDS = {
+    "Alabama": (32.8, -86.8), "Alaska": (64.2, -149.5), "Arizona": (34.2, -111.7),
+    "Arkansas": (34.7, -92.4), "California": (36.8, -119.4), "Colorado": (39.0, -105.5),
+    "Connecticut": (41.6, -72.7), "Delaware": (38.9, -75.5), "Florida": (28.6, -82.4),
+    "Georgia": (32.6, -83.4), "Hawaii": (20.8, -156.3), "Idaho": (44.2, -114.5),
+    "Illinois": (40.0, -89.2), "Indiana": (39.9, -86.3), "Iowa": (42.0, -93.5),
+    "Kansas": (38.5, -98.4), "Kentucky": (37.8, -85.0), "Louisiana": (31.0, -91.9),
+    "Maine": (45.4, -69.2), "Maryland": (39.0, -76.7), "Massachusetts": (42.3, -71.8),
+    "Michigan": (44.9, -85.5), "Minnesota": (46.3, -94.3), "Mississippi": (32.7, -89.7),
+    "Missouri": (38.4, -92.5), "Montana": (47.0, -109.6), "Nebraska": (41.5, -99.8),
+    "Nevada": (39.3, -116.6), "New Hampshire": (43.7, -71.6), "New Jersey": (40.2, -74.5),
+    "New Mexico": (34.4, -106.1), "New York": (42.9, -75.5), "North Carolina": (35.6, -79.4),
+    "North Dakota": (47.5, -100.3), "Ohio": (40.3, -82.8), "Oklahoma": (35.6, -97.5),
+    "Oregon": (44.0, -120.6), "Pennsylvania": (40.9, -77.8), "Rhode Island": (41.7, -71.5),
+    "South Carolina": (33.9, -80.9), "South Dakota": (44.4, -100.2), "Tennessee": (35.8, -86.4),
+    "Texas": (31.0, -99.3), "Utah": (39.3, -111.7), "Vermont": (44.1, -72.7),
+    "Virginia": (37.5, -78.9), "Washington": (47.4, -120.4), "West Virginia": (38.6, -80.6),
+    "Wisconsin": (44.3, -89.7), "Wyoming": (42.9, -107.5),
+}
 
-    state_rows = combined[combined["kind"] == "State"]
-    country_rows = combined[combined["kind"] == "Country"]
+COUNTRY_CENTROIDS = {
+    "China": (35.0, 104.0), "Germany": (51.1, 10.4), "Japan": (36.2, 138.2),
+    "India": (22.0, 79.0), "United Kingdom": (54.0, -2.0), "France": (46.6, 2.2),
+    "Italy": (42.8, 12.5), "Brazil": (-10.3, -52.9), "Canada": (56.1, -106.3),
+    "Russia": (61.5, 105.3), "Mexico": (23.6, -102.5), "Australia": (-25.0, 133.8),
+    "South Korea": (36.5, 127.8), "Spain": (40.2, -3.7), "Indonesia": (-2.5, 118.0),
+    "Netherlands": (52.1, 5.3), "Turkey": (39.0, 35.2), "Saudi Arabia": (23.9, 45.1),
+    "Switzerland": (46.8, 8.2), "Poland": (51.9, 19.1), "Belgium": (50.5, 4.5),
+    "Sweden": (60.1, 18.6), "Ireland": (53.4, -8.2), "Israel": (31.0, 34.8),
+    "Thailand": (15.9, 100.9), "Singapore": (1.35, 103.8), "UAE": (23.4, 53.8),
+    "Norway": (60.5, 8.5), "Philippines": (12.9, 121.8), "Denmark": (56.2, 9.5),
+    "Malaysia": (4.2, 101.9), "Hong Kong": (22.3, 114.2), "South Africa": (-30.6, 22.9),
+    "Colombia": (4.6, -74.3), "Finland": (61.9, 25.7), "Portugal": (39.4, -8.2),
+    "New Zealand": (-40.9, 174.9), "Greece": (39.1, 21.8), "Hungary": (47.2, 19.5),
+    "Morocco": (31.8, -7.1), "Slovakia": (48.7, 19.7), "Ecuador": (-1.8, -78.2),
+    "Kenya": (-0.0, 37.9), "Iceland": (64.96, -19.0),
+}
+
+
+def world_top30_economies(latest: pd.DataFrame) -> go.Figure:
+    states = latest[["state", "gdp"]].dropna().copy()
+    states["gdp_b"] = states["gdp"] / 1e9
+    states["kind"] = "U.S. state"
+    states["label"] = states["state"]
+    states["lat"] = states["state"].map(lambda s: STATE_CENTROIDS.get(s, (None, None))[0])
+    states["lon"] = states["state"].map(lambda s: STATE_CENTROIDS.get(s, (None, None))[1])
+
+    countries = pd.DataFrame(COUNTRY_GDP_2023_BILLIONS, columns=["label", "gdp_b"])
+    countries["kind"] = "Country"
+    countries["lat"] = countries["label"].map(lambda c: COUNTRY_CENTROIDS.get(c, (None, None))[0])
+    countries["lon"] = countries["label"].map(lambda c: COUNTRY_CENTROIDS.get(c, (None, None))[1])
+
+    us_total = float(states["gdp_b"].sum())
+    us_row = pd.DataFrame([{
+        "label": "U.S.", "gdp_b": us_total, "kind": "Country",
+        "lat": 39.8, "lon": -98.6,
+    }])
+
+    combined = pd.concat([us_row, countries, states[["label", "gdp_b", "kind", "lat", "lon"]]], ignore_index=True)
+    combined = combined.dropna(subset=["lat", "lon"])
+    combined = combined.sort_values("gdp_b", ascending=False).reset_index(drop=True)
+    combined["rank"] = combined.index + 1
+    top = combined.head(50).copy()
+
+    color_top = COLORS["gold"]
+    color_country = COLORS["blue"]
+    color_state = COLORS["red"]
+
+    def marker_color(row):
+        if row["rank"] <= 5:
+            return color_top
+        return color_state if row["kind"] == "U.S. state" else color_country
+
+    top["color"] = top.apply(marker_color, axis=1)
+
+    sizes = np.clip(np.sqrt(top["gdp_b"]) * 1.05, 22, 56)
 
     fig = go.Figure()
+    # Soft outer halo ring under each marker for depth
     fig.add_trace(
-        go.Bar(
-            x=country_rows["gdp_b"],
-            y=country_rows["label"],
-            orientation="h",
-            name="Country",
-            marker=dict(color=COLORS["gold"], line=dict(width=0)),
-            opacity=0.12,
-            hovertemplate="<b>%{y}</b><br>2023 GDP: $%{x:,.0f} B<extra>Country</extra>",
-            meta="country",
+        go.Scattergeo(
+            lon=top["lon"],
+            lat=top["lat"],
+            mode="markers",
+            marker=dict(
+                size=sizes + 10,
+                color=top["color"],
+                opacity=0.14,
+                line=dict(width=0),
+            ),
+            hoverinfo="skip",
+            showlegend=False,
         )
     )
     fig.add_trace(
-        go.Bar(
-            x=state_rows["gdp_b"],
-            y=state_rows["label"],
-            orientation="h",
-            name="U.S. state",
-            marker=dict(color=COLORS["teal"], line=dict(width=0)),
-            opacity=0.95,
-            hovertemplate="<b>%{y}</b><br>2023 GDP: $%{x:,.0f} B<extra>U.S. state</extra>",
-            meta="state",
+        go.Scattergeo(
+            lon=top["lon"],
+            lat=top["lat"],
+            text=top["rank"].astype(str),
+            textfont=dict(color="#ffffff", size=12, family=BODY_FONT),
+            mode="markers+text",
+            marker=dict(
+                size=sizes,
+                color=top["color"],
+                line=dict(color="#ffffff", width=1.4),
+                opacity=0.94,
+            ),
+            customdata=np.stack([top["label"], top["gdp_b"], top["kind"], top["rank"]], axis=-1),
+            hovertemplate="<b>#%{customdata[3]} %{customdata[0]}</b><br>%{customdata[2]}<br>2023/24 GDP: $%{customdata[1]:,.0f} B<extra></extra>",
+            showlegend=False,
         )
     )
-    fig.update_yaxes(categoryorder="array", categoryarray=order, tickfont=dict(size=10))
-    fig.update_xaxes(title="2023 GDP (USD, billions, nominal)", type="log", tickformat="$~s")
+
+    fig.update_geos(
+        projection_type="natural earth",
+        projection_scale=1.15,
+        center=dict(lat=18, lon=10),
+        showland=True,
+        landcolor="#f3ecde",
+        showocean=True,
+        oceancolor="#e7eef3",
+        showcountries=True,
+        countrycolor="rgba(23,23,23,0.08)",
+        showframe=False,
+        showcoastlines=True,
+        coastlinecolor="rgba(23,23,23,0.18)",
+        coastlinewidth=0.4,
+        bgcolor="rgba(0,0,0,0)",
+        showlakes=True,
+        lakecolor="#e7eef3",
+        domain=dict(x=[0, 1], y=[0, 1]),
+    )
     fig.update_layout(
-        barmode="overlay",
-        bargap=0.25,
-        legend=dict(orientation="h", y=1.04, x=0, yanchor="bottom"),
-        margin=dict(l=160, r=32, t=24, b=56),
+        margin=dict(l=0, r=0, t=0, b=28),
+        annotations=[
+            dict(
+                x=0.01, y=-0.02, xref="paper", yref="paper", xanchor="left",
+                text="Gold = top 5 · Blue = other countries · Red = U.S. states · Marker size scales with GDP · Hover for details",
+                showarrow=False, font=dict(size=12, color=COLORS["ink"], family=BODY_FONT),
+            )
+        ],
     )
-    fig = plot_layout(fig, height=1280)
-    return fig
+    return plot_layout(fig, height=560)
 
 
 def state_mobility_distributions() -> go.Figure:
@@ -4927,7 +5853,7 @@ def state_mobility_distributions() -> go.Figure:
         categoryarray=order,
         tickmode="linear",
         dtick=1,
-        tickfont=dict(size=10),
+        tickfont=dict(size=11),
     )
     fig = plot_layout(fig, height=880)
     fig.update_layout(margin=dict(l=148, r=34, t=86, b=86))
@@ -5017,7 +5943,7 @@ def state_income_distributions_2023(income_panel: pd.DataFrame) -> go.Figure:
     )
     fig.update_yaxes(
         title="", categoryorder="array", categoryarray=order,
-        tickmode="linear", dtick=1, tickfont=dict(size=10),
+        tickmode="linear", dtick=1, tickfont=dict(size=11),
     )
     fig = plot_layout(fig, height=880)
     fig.update_layout(margin=dict(l=148, r=34, t=86, b=86))
@@ -5132,7 +6058,7 @@ def state_gdp_distributions_2023(county_df: pd.DataFrame) -> go.Figure:
         categoryarray=order,
         tickmode="linear",
         dtick=1,
-        tickfont=dict(size=10),
+        tickfont=dict(size=11),
     )
     fig = plot_layout(fig, height=880)
     fig.update_layout(margin=dict(l=148, r=34, t=86, b=86))
@@ -5151,6 +6077,116 @@ def fig_html(fig: go.Figure, slug: str) -> str:
             "responsive": True,
             "modeBarButtonsToRemove": ["lasso2d", "select2d"],
         },
+    )
+
+
+LOGO_FILES: dict[str, str] = {
+    "bea": "Dashboard/assets/logos/bea.png",
+    "census": "Dashboard/assets/logos/census.png",
+    "nsf": "Dashboard/assets/logos/nsf.png",
+    "usda": "Dashboard/assets/logos/usda.png",
+    "imf": "Dashboard/assets/logos/imf.png",
+    "worldbank": "Dashboard/assets/logos/worldbank.png",
+    "plotly": "Dashboard/assets/logos/plotly.png",
+}
+
+
+def _encode_logo(path: str) -> str:
+    p = Path(path)
+    if not p.exists():
+        return ""
+    return "data:image/png;base64," + base64.b64encode(p.read_bytes()).decode("ascii")
+
+
+def _logo_uris() -> dict[str, str]:
+    return {key: _encode_logo(path) for key, path in LOGO_FILES.items()}
+
+
+# (label, description, color, logo-key-or-None)
+CHART_SOURCES: dict[str, list[tuple[str, str, str, str | None]]] = {
+    "1": [
+        ("BEA", "State nominal GDP, 2023 (Regional)", "#1463a1", "bea"),
+        ("IMF", "Country nominal GDP, 2023–24", "#2a7f62", "imf"),
+        ("World Bank", "Country GDP cross-check", "#1a4c8a", "worldbank"),
+    ],
+    "2": [
+        ("NSF NCSES", "State R&D spending, 2006–2023", "#1f4e79", "nsf"),
+        ("BEA", "State GDP per capita", "#1463a1", "bea"),
+        ("Census", "State population (ACS)", "#003366", "census"),
+        ("Fortune", "F500 HQ counts by state", "#a3162b", None),
+    ],
+    "3": [
+        ("BEA", "CAGDP1 county GDP, 2023", "#1463a1", "bea"),
+        ("Census", "ACS 2023 county population", "#003366", "census"),
+    ],
+    "4": [
+        ("BEA", "CAINC1 breakout score", "#1463a1", "bea"),
+        ("Census", "ACS 2023 — education, income, poverty, housing, unemployment", "#003366", "census"),
+        ("BEA", "CAGDP1 county GDP per capita", "#1463a1", "bea"),
+    ],
+    "5": [
+        ("BEA", "CAGDP1 target (GDP per-capita CAGR)", "#1463a1", "bea"),
+        ("Census", "ACS 2023 county traits (education, age, migration, occupations)", "#003366", "census"),
+        ("USDA ERS", "Rural-Urban Continuum Codes, 2023", "#4a6b2a", "usda"),
+        ("NSF NCSES", "State R&D, 2006 (pre-period)", "#1f4e79", "nsf"),
+        ("Fortune", "State F500 HQ density, 2006", "#a3162b", None),
+        ("BEA", "CAGDP2 industry composition", "#1463a1", "bea"),
+    ],
+}
+
+
+def source_sidecar_html(num: str, logos: dict[str, str]) -> str:
+    sources = CHART_SOURCES.get(num)
+    if not sources:
+        return ""
+    tiles = []
+    for short, desc, color, logo_key in sources:
+        uri = logos.get(logo_key, "") if logo_key else ""
+        if uri:
+            head = f'<img class="source-logo" src="{uri}" alt="{short} logo">'
+        else:
+            head = f'<div class="source-chip" style="background:{color};">{short}</div>'
+        tip = html.escape(f"{short} — {desc}")
+        tiles.append(
+            f'<div class="source-tile" title="{tip}">'
+            f'{head}'
+            f'<div class="source-label">{short}</div>'
+            f'<div class="source-desc">{desc}</div>'
+            f'</div>'
+        )
+    return (
+        '<aside class="source-sidecar" aria-label="Data sources">'
+        '<div class="source-sidecar-title">Sources</div>'
+        f'{"".join(tiles)}'
+        '</aside>'
+    )
+
+
+def source_carousel_html(num: str, logos: dict[str, str]) -> str:
+    sources = CHART_SOURCES.get(num)
+    if not sources:
+        return ""
+    tiles = []
+    for short, desc, color, logo_key in sources:
+        uri = logos.get(logo_key, "") if logo_key else ""
+        if uri:
+            head = f'<img class="source-logo" src="{uri}" alt="{short} logo">'
+        else:
+            head = f'<div class="source-chip" style="background:{color};">{short}</div>'
+        tiles.append(
+            f'<div class="source-tile carousel-tile">'
+            f'{head}'
+            f'<div class="source-label">{short}</div>'
+            f'<div class="source-desc">{desc}</div>'
+            f'</div>'
+        )
+    # duplicate the set so the marquee loops seamlessly
+    strip = "".join(tiles) * 2
+    return (
+        '<div class="source-carousel" aria-label="Data sources">'
+        '<div class="source-carousel-title">Sources</div>'
+        f'<div class="source-carousel-viewport"><div class="source-carousel-track">{strip}</div></div>'
+        '</div>'
     )
 
 
@@ -5178,119 +6214,36 @@ def make_html(
     charts = [
         (
             "1",
-            "States On The World Stage",
-            "Metric: 2023 nominal GDP (USD billions) for U.S. states (BEA, teal) interleaved with national economies (World Bank, gold). Log scale.",
-            state_vs_country_gdp(latest),
+            "California, Texas, Florida vs World Economies",
+            "Metric: 2023/24 nominal GDP (USD). California, Texas, and Florida are shown against their three nearest-in-size national economies. Below, the world's top 50 economies — U.S. states included — plotted on a natural-earth projection. Zoom in to reveal names.",
+            world_top30_economies(latest),
         ),
         (
             "2",
-            "Size Is Not Prosperity",
-            "Metric: each state's rank by total 2023 GDP (left) vs rank by 2023 GDP per capita (right). Lines falling show size-driven states; lines rising show per-capita leaders. Teal = ranks ≥8 spots higher on per-capita; red = ranks ≥8 spots lower.",
-            size_vs_per_capita_ranks(latest),
+            "R&D Drives Prosperity",
+            "Metric: animated bubble chart of U.S. states from 2006–2023. X = state R&D spending ($K, log scale). Y = state GDP per capita. Bubble size = population. Bubble color = number of Fortune 500 headquarters. Press play to watch the cluster migrate up-and-to-the-right.",
+            state_bubble_animation(merged),
         ),
         (
             "3",
-            "Counties Move",
-            "Metric: county per-capita personal income indexed to the U.S. average (U.S. = 100), BEA CAINC1, 1969–2024.",
-            county_mobility_animation(county_income_panel),
+            "State Engines",
+            "Metric: each county's share of its state's total GDP in 2023 (BEA CAGDP1). Use the dropdown to pick a state. Top 10 counties shown plus a grey bar for all remaining counties combined.",
+            state_county_share_breakdown(county),
         ),
         (
             "4",
-            "Breakout Atlas",
-            "Metric: county Breakout Score mapped on 2023 county polygons (BEA CAINC1 long-run relative per-capita income change).",
-            county_breakout_atlas(show_buttons=False),
-        ),
-        (
-            "5",
-            "What Factors Matter?",
-            "Metric: L1-regularized logistic regression predicting whether a county's Breakout Score is positive (it gained relative-income ground vs. 1969–79). Features were trimmed to reduce collinearity (pairs with r > 0.8 or VIF > 10 dropped). Right panel shows the standardized coefficient with a 5–95% band from 200 bootstrap resamples — overlap with zero means the effect is not stable. Note: the 1969–73 income-index coefficient is negative because counties that started high had less room to rise — that is mechanical reversion, not a causal factor. This is a descriptive fit, not a causal or out-of-sample forecast.",
-            model_diagnostics(),
-        ),
-    ]
-    s1_income_fig = state_income_distributions_2023(county_income_panel)
-    s1_gdp_fig = state_gdp_distributions_2023(county)
-    s2_income_fig = metro_nonmetro_lens()
-    s2_gdp_fig = metro_nonmetro_lens_gdp()
-    support_charts = [
-        (
-            "S1",
-            "States Differ",
-            "Metric: distribution of county outcomes within each state, 2023 snapshot. Toggle between county per-capita personal income (BEA CAINC1, where residents live) and county GDP per capita (BEA CAGDP1, where production happens). Counties with population ≥ 20k. New York County (Manhattan) excluded as an outlier that dominates the axis on both views.",
-            s1_income_fig,
-        ),
-        (
-            "S2",
-            "Metro Lens",
-            "Metric: county outcomes grouped by USDA ERS 2023 Rural-Urban Continuum Code (metro vs nonmetro tiers). Toggle between per-capita personal-income mobility (1969→2024 index change) and county GDP per capita in 2023 (level, not change).",
-            s2_income_fig,
-        ),
-        (
-            "S3",
-            "Industry Signature",
-            "Metric: dominant 2023 industry share of county GDP (BEA CAGDP2) plotted against Breakout Score.",
-            industry_composition_lens(),
-        ),
-        (
-            "A",
-            "Education Gradient",
-            "Metric: ACS 2023 bachelor's-or-higher share vs GDP per capita and Breakout Score, with residuals after controlling for metro class and population.",
-            education_income_diagnostics(),
-        ),
-        (
-            "B",
-            "State Engines",
-            "Metric: share of state GDP produced by each state's top-GDP county, plus county GDP per capita, 2023.",
-            state_engine_breakdown(county, latest),
-        ),
-        (
-            "C",
-            "County Quality Of Life",
-            "Metric: composite z-scored index across income, poverty, education, unemployment, and housing from ACS 2023.",
-            county_quality_of_life_lens(),
-        ),
-        (
-            "D",
-            "QoL vs Breakout Correlation",
-            "Metric: Pearson correlation between the QoL composite and Breakout Score across counties, with scatter and fit line.",
+            "Quality of Life vs GDP per Capita",
+            "Metric: Pearson correlation between a composite Quality-of-Life index (income, poverty, education, unemployment, housing; ACS 2023) and 2024 county GDP per capita (BEA CAGDP1). Counties with ≥10k residents; the top 1% GDP/capita (oil-extraction microcounties) trimmed.",
             qol_breakout_correlation_lens(),
         ),
         (
-            "E",
-            "County Clusters (K-Means)",
-            "Metric: K-means (K=3) clusters on standardized county traits; centroid profiles on each feature.",
-            kmeans_cluster_lens(),
-        ),
-        (
-            "F",
-            "Clusters On The Map",
-            "Metric: K-means (K=3) cluster assignment mapped on county polygons.",
-            kmeans_cluster_map(),
-        ),
-        (
-            "G",
-            "Picking K",
-            "Metric: within-cluster sum of squares (elbow) and silhouette score across K = 2–10.",
-            kmeans_k_diagnostic(),
-        ),
-        (
-            "H",
-            "KMeans vs GMM",
-            "Metric: silhouette, BIC, and log-likelihood for K-means vs Gaussian mixture at K=3.",
-            cluster_model_check(),
-        ),
-        (
-            "I",
-            "GMM Tied Map",
-            "Metric: Gaussian mixture (tied covariance, K=3) cluster assignment mapped on county polygons.",
-            gmm_tied_cluster_map(),
-        ),
-        (
-            "J",
-            "Path Volatility vs Breakout Score",
-            "Metric: standard deviation of annual changes in the county relative-income index, 1969–2024, plotted against Breakout Score.",
-            volatility_vs_breakout_lens(),
+            "5",
+            "Predicting County GDP Growth",
+            "Target: log-CAGR of real GDP per capita, 2001→2024 (winsorized at 1st/99th pct, counties with pop ≥ 5,000). Features grouped into three families — pre-period baselines (2001 GDP/population, 1969 income index, state R&D and F500 in 2006), structural/geographic (industry mix, rural-urban continuum, Census division), and slow-moving human capital (ACS 2023 education, occupations, migration, age, housing, QoL). Random Forest (800 trees, bootstrapped, sqrt-feature split). Left panel: held-out predictions with density underlay. Right panel: permutation importance on held-out set, with ±1.96·σ whiskers from 30 shuffle repeats and direction arrows (▲▼) for Spearman sign vs. the target.",
+            county_gdp_growth_prediction(),
         ),
     ]
+    support_charts: list = []
     atlas_records = atlas_story_records()
     try:
         atlas_json = json.dumps(atlas_records, ensure_ascii=False, allow_nan=False).replace("</", "<\\/")
@@ -5302,29 +6255,44 @@ def make_html(
         section_class = "viz-block atlas-block" if is_atlas else "viz-block"
         kicker = f"Visual {num} · Atlas Plate" if is_atlas else f"Visual {num}"
         controls = ""
-        plot_html = f'<div class="plot-wrap">{fig_html(fig, f"story-{num}")}</div>'
         if num == "1":
-            tick_years = [1979, 1986, 1993, 2000, 2007, 2014, 2021, 2024]
-            ticks = "".join(f"<span>{year}</span>" for year in tick_years)
-            controls = f"""
-          <div class="custom-timeline" data-plot="story-1">
-            <div class="timeline-row">
-              <div>
-                <div class="timeline-label">Animation year</div>
-                <div class="timeline-year"><span data-year-label>1979</span></div>
+            focus_html = build_state_focus_cards_html(latest, ["California", "Texas", "Florida", "New York"])
+            hypothesis_html = (
+                '<div class="hypothesis-card">'
+                '<span class="hypothesis-kicker">Research Question</span>'
+                "Why do certain states in the US perform so well economically in comparison to their American counterparts and countries across the world?"
+                '</div>'
+                '<div class="hypothesis-card">'
+                '<span class="hypothesis-kicker">Hypothesis</span>'
+                "Our hypothesis is that the frequency of industry leaders, specifically Fortune 500 companies in addition to population growth and increases in R&amp;D spending have largely contributed to why certain states top the economic leaderboard in terms of GDP."
+                "</div>"
+            )
+            plot_html = (
+                f'<div class="plot-wrap">{fig_html(fig, f"story-{num}")}</div>'
+                f'<div class="focus-only-wrap">{focus_html}</div>'
+                f'{hypothesis_html}'
+            )
+        elif num == "5" and hasattr(fig, "_rf_metrics"):
+            m = fig._rf_metrics
+            metrics_card = f"""
+            <div class="rf-metrics-card">
+              <div class="rf-metrics-head">
+                <span class="rf-metrics-kicker">Random Forest</span>
+                <span class="rf-metrics-sub">800 trees · sqrt features · 25% holdout</span>
               </div>
-              <div class="timeline-actions">
-                <button type="button" data-action="play">Play</button>
-                <button type="button" data-action="pause">Pause</button>
+              <div class="rf-metrics-grid">
+                <div class="rf-metric"><span class="rf-metric-label">Holdout R²</span><span class="rf-metric-value">{m['test_r2']:.2f}</span></div>
+                <div class="rf-metric"><span class="rf-metric-label">OOB R²</span><span class="rf-metric-value">{m['oob_r2']:.2f}</span></div>
+                <div class="rf-metric"><span class="rf-metric-label">5-fold CV R²</span><span class="rf-metric-value">{m['cv_r2']:.2f} <span class="rf-metric-pm">± {m['cv_sd']:.2f}</span></span></div>
+                <div class="rf-metric"><span class="rf-metric-label">Train R²</span><span class="rf-metric-value">{m['train_r2']:.2f}</span></div>
+                <div class="rf-metric"><span class="rf-metric-label">Counties</span><span class="rf-metric-value">{m['n']:,}</span></div>
+                <div class="rf-metric"><span class="rf-metric-label">Features</span><span class="rf-metric-value">{m['features']}</span></div>
               </div>
             </div>
-            <input aria-label="Select year" data-year-slider type="range" min="1979" max="2024" value="1979" step="1">
-            <div class="timeline-ticks">{ticks}</div>
-            <div class="timeline-caption">Drag through income history, or play the animation from the 1979 starting year.</div>
-          </div>
             """
-        if num == "2":
-            controls = build_state_focus_cards_html(latest, ["California", "Texas", "Florida"])
+            plot_html = f'{metrics_card}<div class="plot-wrap">{fig_html(fig, f"story-{num}")}</div>'
+        else:
+            plot_html = f'<div class="plot-wrap">{fig_html(fig, f"story-{num}")}</div>'
         if is_atlas:
             options = "\n".join(
                 f'<option value="{record["fips"]}">{record["state"]} · {record["name"]}</option>'
@@ -5356,6 +6324,8 @@ def make_html(
           </div>
           <script type="application/json" id="atlas-card-data">{atlas_json}</script>
             """
+        sidecar = source_sidecar_html(num, logo_uris)
+        plot_block = f'<div class="viz-with-sidecar">{plot_html}{sidecar}</div>' if sidecar else plot_html
         return f"""
         <section class="{section_class}" id="chart-{num}">
           <div class="section-kicker">{kicker}</div>
@@ -5363,11 +6333,12 @@ def make_html(
             <h2>{title}</h2>
             <p>{note}</p>
           </div>
-          {plot_html}
+          {plot_block}
           {controls}
         </section>
         """
 
+    logo_uris = _logo_uris()
     chart_sections = "\n".join(
         chart_section_html(num, title, note, fig)
         for num, title, note, fig in charts
@@ -5425,6 +6396,8 @@ def make_html(
         for num, title, note, fig in support_charts
     )
 
+    verdict_tiles_html = fig_html(hypothesis_tile_scatters(merged, county_gdp_index), "story-verdict-tiles")
+
     top_list = ", ".join(f"{STATE_ABBR[s]} ${v:,.0f}" for s, v in zip(top_states["state"], top_states["gdp_per_capita"]))
     bottom_list = ", ".join(f"{STATE_ABBR[s]} ${v:,.0f}" for s, v in zip(bottom_states["state"], bottom_states["gdp_per_capita"]))
     bg_path = OUT / "assets" / "us_space_view.jpg"
@@ -5439,7 +6412,7 @@ def make_html(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Why Some County Economies Break Out</title>
+  <title>American Powerhouses: Economic Dominance within State Lines</title>
   <script src="https://cdn.plot.ly/plotly-{PLOTLY_JS_VERSION}.min.js"></script>
   <style>
     :root {{
@@ -5463,11 +6436,26 @@ def make_html(
     body {{
       margin: 0;
       color: var(--ink);
-      background: var(--paper);
+      background-color: var(--paper);
       background-image:
-        radial-gradient(circle at 7% -8%, rgba(34,124,128,0.14), transparent 26%),
-        radial-gradient(circle at 92% 6%, rgba(193,154,48,0.13), transparent 24%),
-        linear-gradient(180deg, #fcfcfa 0%, var(--paper) 48%, #f6f5f1 100%);
+        url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.82' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.09 0 0 0 0 0.09 0 0 0 0 0.09 0 0 0 0.055 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>"),
+        radial-gradient(circle at 7% 2%, rgba(34,124,128,0.12), transparent 22%),
+        radial-gradient(circle at 92% 4%, rgba(193,154,48,0.12), transparent 22%),
+        radial-gradient(circle at 88% 34%, rgba(34,124,128,0.09), transparent 26%),
+        radial-gradient(circle at 10% 58%, rgba(193,154,48,0.10), transparent 28%),
+        radial-gradient(circle at 92% 82%, rgba(180,59,69,0.08), transparent 26%),
+        linear-gradient(180deg,
+          #fbf7ec 0%,
+          #f3efe5 14%,
+          #edeff1 32%,
+          #f1ede2 50%,
+          #e8edef 68%,
+          #efe9d9 86%,
+          #f6efdd 100%
+        );
+      background-repeat: repeat, no-repeat, no-repeat, no-repeat, no-repeat, no-repeat, no-repeat;
+      background-size: 200px 200px, auto, auto, auto, auto, auto, 100% 100%;
+      background-attachment: fixed, scroll, scroll, scroll, scroll, scroll, scroll;
       font-family: {BODY_FONT} !important;
       line-height: 1.45;
       letter-spacing: 0;
@@ -5547,16 +6535,70 @@ def make_html(
       letter-spacing: 0;
       margin-bottom: 22px;
     }}
+    .hero-eyebrow {{
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 22px;
+    }}
+    .hero-eyebrow-bar {{
+      display: block;
+      width: 56px;
+      height: 3px;
+      background: var(--gold);
+      box-shadow: 0 1px 0 rgba(193,154,48,0.25);
+    }}
+    .hero-eyebrow-text {{
+      font-family: {BODY_FONT};
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: var(--gold);
+    }}
     h1 {{
       max-width: 940px;
       margin: 0;
       font-family: {DISPLAY_FONT} !important;
-      font-weight: 400;
-      font-size: clamp(54px, 7vw, 104px);
-      line-height: 0.92;
       font-weight: 500;
+      font-size: clamp(40px, 5.2vw, 76px);
+      line-height: 0.98;
       letter-spacing: 0;
     }}
+    h1::after {{
+      content: "";
+      display: block;
+      width: 96px;
+      height: 4px;
+      background: linear-gradient(90deg, var(--gold) 0%, rgba(193,154,48,0.15) 100%);
+      border-radius: 2px;
+      margin-top: 28px;
+    }}
+    .hero-subtitle {{
+      max-width: 760px;
+      margin: 22px 0 0;
+      font-family: {DISPLAY_FONT};
+      font-style: italic;
+      font-weight: 400;
+      font-size: clamp(18px, 1.9vw, 24px);
+      line-height: 1.38;
+      color: #3a3a3a;
+    }}
+    .hero-byline {{
+      margin-top: 30px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      font-family: {BODY_FONT};
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }}
+    .hero-byline-item {{ color: var(--ink); }}
+    .hero-byline-sep {{ color: var(--gold); font-weight: 900; }}
     .thesis {{
       max-width: 820px;
       margin: 30px 0 0;
@@ -5616,6 +6658,164 @@ def make_html(
       margin-top: 10px;
       color: var(--muted);
       font-size: 14px;
+    }}
+    .verdict-block {{
+      margin-top: 56px;
+    }}
+    .verdict-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 20px;
+      margin-top: 24px;
+    }}
+    @media (max-width: 880px) {{
+      .verdict-grid {{ grid-template-columns: 1fr; }}
+    }}
+    .verdict-card {{
+      background: #ffffff;
+      border: 1px solid rgba(23,23,23,0.10);
+      border-top: 6px solid var(--teal);
+      border-radius: var(--radius-sm);
+      padding: 22px 22px 24px;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.06);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }}
+    .verdict-card.verdict-yes {{ border-top-color: #2e8f78; }}
+    .verdict-card.verdict-partial {{ border-top-color: #d4a017; }}
+    .verdict-card.verdict-no {{ border-top-color: #c05a3c; }}
+    .verdict-badge {{
+      align-self: flex-start;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      padding: 5px 11px;
+      border-radius: 999px;
+      background: rgba(46,143,120,0.12);
+      color: #2e8f78;
+    }}
+    .verdict-card.verdict-partial .verdict-badge {{
+      background: rgba(212,160,23,0.14);
+      color: #9a7100;
+    }}
+    .verdict-card.verdict-no .verdict-badge {{
+      background: rgba(192,90,60,0.12);
+      color: #a04a2f;
+    }}
+    .verdict-pillar {{
+      font-family: {DISPLAY_FONT};
+      font-size: 24px;
+      font-weight: 500;
+      color: var(--ink);
+      line-height: 1.15;
+    }}
+    .verdict-finding {{
+      color: var(--ink);
+      font-size: 15px;
+      line-height: 1.55;
+    }}
+    .verdict-evidence {{
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 12px 14px;
+      background: rgba(34,124,128,0.05);
+      border-left: 3px solid var(--teal);
+      border-radius: 0 6px 6px 0;
+    }}
+    .verdict-metric {{
+      font-family: {DISPLAY_FONT};
+      font-size: 22px;
+      font-weight: 600;
+      color: var(--teal);
+      line-height: 1;
+    }}
+    .verdict-metric-label {{
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.4;
+    }}
+    .verdict-ref {{
+      margin-top: auto;
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-weight: 600;
+    }}
+    .verdict-summary {{
+      margin-top: 28px;
+      padding: 26px 30px;
+      background: linear-gradient(135deg, #0f2e29 0%, #1c4138 100%);
+      color: #f2efe6;
+      border-radius: var(--radius-sm);
+      box-shadow: 0 8px 28px rgba(0,0,0,0.18);
+    }}
+    .verdict-summary-kicker {{
+      font-size: 11px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      font-weight: 700;
+      color: #f7c948;
+      margin-bottom: 10px;
+    }}
+    .verdict-summary p {{
+      margin: 0;
+      font-size: 17px;
+      line-height: 1.6;
+      color: #f2efe6;
+    }}
+    .verdict-summary strong {{
+      color: #f7c948;
+      font-weight: 600;
+    }}
+    .hypothesis-card {{
+      margin: 28px auto 8px;
+      max-width: 860px;
+      padding: 20px 26px;
+      background: linear-gradient(180deg, #ffffff 0%, #fbf7ee 100%);
+      border-left: 4px solid var(--gold, #d4a017);
+      border-radius: 0 10px 10px 0;
+      box-shadow: 0 4px 18px rgba(0,0,0,0.08);
+      font-size: 17px;
+      line-height: 1.6;
+      color: #1a1a1a;
+    }}
+    .hypothesis-card .hypothesis-kicker {{
+      display: block;
+      font-size: 11px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      font-weight: 700;
+      color: var(--gold, #b8860b);
+      margin-bottom: 8px;
+    }}
+    .hero-hypothesis {{
+      margin-top: 22px;
+      max-width: 720px;
+      padding: 18px 22px;
+      color: #f6f7f8;
+      font-size: 16px;
+      line-height: 1.55;
+      font-weight: 400;
+      background: rgba(10, 14, 20, 0.62);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      border-left: 4px solid var(--gold, #d4a017);
+      border-radius: 0 10px 10px 0;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.28);
+    }}
+    .hero-hypothesis::before {{
+      content: "Hypothesis";
+      display: block;
+      font-size: 11px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      font-weight: 700;
+      color: var(--gold, #d4a017);
+      margin-bottom: 6px;
     }}
     .metric-definition {{
       border-left: 5px solid var(--teal);
@@ -5690,12 +6890,22 @@ def make_html(
       max-width: 820px;
     }}
     .section-kicker {{
-      color: var(--red);
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--gold);
       font-size: 12px;
       text-transform: uppercase;
       font-weight: 800;
-      letter-spacing: 0.04em;
-      margin-bottom: 8px;
+      letter-spacing: 0.14em;
+      margin-bottom: 10px;
+    }}
+    .section-kicker::before {{
+      content: "";
+      width: 28px;
+      height: 2px;
+      background: var(--gold);
+      border-radius: 2px;
     }}
     .section-head {{
       display: grid;
@@ -5719,6 +6929,208 @@ def make_html(
       padding: 12px;
       box-shadow: var(--shadow-soft);
       overflow: hidden;
+    }}
+    .rf-metrics-card {{
+      background: linear-gradient(135deg, #ffffff 0%, #faf7ef 100%);
+      border: 1px solid rgba(23,23,23,0.14);
+      border-left: 6px solid var(--gold);
+      border-radius: var(--radius-md);
+      padding: 18px 22px;
+      margin-bottom: 16px;
+      box-shadow: var(--shadow-soft);
+    }}
+    .rf-metrics-head {{
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }}
+    .rf-metrics-kicker {{
+      font-family: {DISPLAY_FONT};
+      font-size: 22px;
+      color: var(--ink);
+      letter-spacing: 0.01em;
+    }}
+    .rf-metrics-sub {{
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-weight: 700;
+    }}
+    .rf-metrics-grid {{
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 14px;
+    }}
+    @media (max-width: 900px) {{
+      .rf-metrics-grid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+    }}
+    .rf-metric {{
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 10px 12px;
+      background: #ffffff;
+      border: 1px solid rgba(23,23,23,0.08);
+      border-radius: 10px;
+    }}
+    .rf-metric-label {{
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      font-weight: 800;
+    }}
+    .rf-metric-value {{
+      font-family: {DISPLAY_FONT};
+      font-size: 28px;
+      line-height: 1;
+      color: var(--ink);
+    }}
+    .rf-metric-pm {{
+      font-family: {BODY_FONT};
+      font-size: 13px;
+      color: var(--muted);
+      font-weight: 600;
+    }}
+    body.presenter .rf-metrics-kicker {{ font-size: 26px; }}
+    body.presenter .rf-metric-value {{ font-size: 34px; }}
+    body.presenter .rf-metric-label {{ font-size: 12px; }}
+    .viz-with-sidecar {{
+      position: relative;
+    }}
+    .source-sidecar {{
+      position: absolute;
+      top: 0;
+      left: 100%;
+      margin-left: 14px;
+      width: 168px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      pointer-events: auto;
+    }}
+    .source-sidecar-title {{
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+      font-weight: 800;
+      margin-bottom: 2px;
+    }}
+    .source-tile {{
+      background: var(--panel);
+      border: 1px solid rgba(23,23,23,0.12);
+      border-radius: 10px;
+      padding: 10px 10px 12px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      gap: 4px;
+      min-height: 108px;
+      transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+      cursor: default;
+    }}
+    .source-tile:hover {{
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.09);
+      border-color: rgba(34,124,128,0.45);
+    }}
+    .source-logo, .source-chip {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 44px;
+      height: 44px;
+      object-fit: contain;
+      margin-bottom: 4px;
+    }}
+    .source-chip {{
+      font-family: {DISPLAY_FONT};
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      color: #ffffff;
+      border-radius: 8px;
+    }}
+    .source-label {{
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--ink);
+      letter-spacing: 0.02em;
+    }}
+    .source-desc {{
+      font-size: 10.5px;
+      line-height: 1.32;
+      color: #4a4a4a;
+    }}
+    @media (max-width: 1640px) {{
+      .page {{ width: min(1060px, calc(100% - 340px)); }}
+      .source-sidecar {{ width: 132px; margin-left: 12px; }}
+      .source-tile {{ padding: 8px 8px 10px; min-height: 96px; }}
+      .source-logo, .source-chip {{ width: 38px; height: 38px; }}
+      .source-label {{ font-size: 10.5px; }}
+      .source-desc {{ font-size: 10px; line-height: 1.28; }}
+    }}
+    @media (max-width: 1280px) {{
+      .page {{ width: min(100% - 28px, 1240px); }}
+      .source-sidecar {{ display: none; }}
+    }}
+    /* ===== Presentation mode (?present=1) ===== */
+    body.presenter {{
+      font-size: 16px;
+    }}
+    body.presenter .page {{
+      width: min(1440px, calc(100% - 480px));
+    }}
+    body.presenter .section-head h2,
+    body.presenter .storyline h2,
+    body.presenter .support-intro h2 {{
+      font-size: clamp(38px, 3.6vw, 58px);
+    }}
+    body.presenter .section-head p,
+    body.presenter .storyline p,
+    body.presenter .support-intro p {{
+      font-size: 19px;
+      line-height: 1.5;
+    }}
+    body.presenter .section-kicker {{
+      font-size: 14px;
+    }}
+    body.presenter .plot-wrap {{
+      padding: 18px;
+    }}
+    body.presenter .source-sidecar {{
+      width: 188px;
+    }}
+    body.presenter .source-sidecar-title {{ font-size: 12px; }}
+    body.presenter .source-tile {{ padding: 12px 12px 14px; min-height: 124px; }}
+    body.presenter .source-logo,
+    body.presenter .source-chip {{ width: 52px; height: 52px; }}
+    body.presenter .source-chip {{ font-size: 16px; }}
+    body.presenter .source-label {{ font-size: 13px; }}
+    body.presenter .source-desc {{ font-size: 12px; line-height: 1.38; }}
+    body.presenter .focus-card {{ width: 320px; }}
+    body.presenter .focus-card-state {{ font-size: 22px; }}
+    body.presenter .focus-card-gdp {{ font-size: 14px; }}
+    body.presenter .hypothesis-card {{
+      max-width: 1100px;
+      font-size: 19px;
+    }}
+    body.presenter .section-head {{ margin-bottom: 18px; }}
+    body.presenter footer {{ font-size: 14px; }}
+    @media (max-width: 1600px) {{
+      body.presenter .page {{ width: min(1280px, calc(100% - 420px)); }}
+      body.presenter .source-sidecar {{ width: 168px; }}
+    }}
+    @media (max-width: 1400px) {{
+      body.presenter .page {{ width: min(100% - 60px, 1260px); }}
+      body.presenter .source-sidecar {{ display: none; }}
     }}
     .s1-toggle {{
       display: flex;
@@ -5766,7 +7178,15 @@ def make_html(
       grid-template-columns: 0.82fr 1.18fr;
     }}
     #chart-1 .plot-wrap {{
-      padding: 14px;
+      padding: 0;
+      background: #e7eef3;
+      overflow: hidden;
+    }}
+    #chart-1 .plot-wrap .js-plotly-plot,
+    #chart-1 .plot-wrap .plot-container,
+    #chart-1 .plot-wrap .svg-container {{
+      width: 100% !important;
+      background: transparent !important;
     }}
     .atlas-block {{
       background:
@@ -5779,6 +7199,7 @@ def make_html(
     .atlas-block .section-kicker {{
       color: var(--teal);
     }}
+    .atlas-block .section-kicker::before {{ background: var(--teal); }}
     .atlas-block .plot-wrap {{
       background: #fbfbfb;
       border-color: rgba(23,23,23,0.16);
@@ -5915,19 +7336,51 @@ def make_html(
     .plot-wrap .js-plotly-plot {{
       width: 100%;
     }}
-    .focus-cards {{
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 18px;
+    .focus-only-wrap {{
+      position: relative;
+      width: calc(100vw - 24px);
+      margin-left: calc(50% - 50vw + 12px);
+      margin-right: calc(50% - 50vw + 12px);
+      padding: 0 16px;
+      box-sizing: border-box;
+    }}
+    .focus-cards-carousel {{
       margin-top: 22px;
+      overflow: hidden;
+      position: relative;
+      -webkit-mask-image: linear-gradient(to right, transparent 0, #000 80px, #000 calc(100% - 80px), transparent 100%);
+              mask-image: linear-gradient(to right, transparent 0, #000 80px, #000 calc(100% - 80px), transparent 100%);
+    }}
+    .focus-cards-track {{
+      display: flex;
+      gap: 14px;
+      width: max-content;
+      animation: focus-marquee 180s linear infinite;
+    }}
+    .focus-cards-track:hover {{
+      animation-play-state: paused;
+    }}
+    @keyframes focus-marquee {{
+      from {{ transform: translateX(0); }}
+      to   {{ transform: translateX(-50%); }}
+    }}
+    @media (prefers-reduced-motion: reduce) {{
+      .focus-cards-track {{ animation: none; }}
     }}
     @media (max-width: 880px) {{
-      .focus-cards {{ grid-template-columns: 1fr; }}
+      .focus-only-wrap {{
+        width: auto;
+        margin-left: 0;
+        margin-right: 0;
+        padding: 0;
+      }}
     }}
     .focus-card {{
       display: flex;
       flex-direction: column;
       gap: 14px;
+      flex: 0 0 auto;
+      width: 280px;
       padding: 18px 18px 20px;
       background: #ffffff;
       border: 1px solid rgba(23,23,23,0.12);
@@ -5959,22 +7412,24 @@ def make_html(
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 10px;
+      gap: 6px;
       background: rgba(34,124,128,0.04);
       border-radius: var(--radius-sm);
-      padding: 10px 10px 8px;
+      padding: 10px 8px 8px;
+      overflow: hidden;
     }}
     .focus-card-vs {{
       font-family: "New York", Georgia, serif;
       font-style: italic;
-      font-size: 15px;
+      font-size: 13px;
       color: var(--muted);
       flex-shrink: 0;
     }}
     .focus-tile-group {{
       display: flex;
-      gap: 8px;
+      gap: 4px;
       flex: 1;
+      min-width: 0;
       justify-content: flex-end;
     }}
     .focus-tile {{
@@ -5982,27 +7437,34 @@ def make_html(
       flex-direction: column;
       align-items: center;
       gap: 4px;
-      flex-shrink: 0;
+      flex: 1 1 0;
+      min-width: 0;
     }}
     .focus-tile-shape {{
-      height: 54px;
-      width: 78px;
+      height: 44px;
+      width: 100%;
       display: flex;
       align-items: center;
       justify-content: center;
     }}
     .focus-tile-shape svg {{ max-height: 100%; max-width: 100%; }}
     .focus-tile-label {{
-      font-size: 10.5px;
+      font-size: 9.5px;
       color: var(--ink);
       text-align: center;
       line-height: 1.15;
-      max-width: 84px;
+      max-width: 100%;
       font-weight: 600;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .focus-tile-state {{
+      flex: 0 0 62px;
     }}
     .focus-tile-state .focus-tile-shape {{
-      height: 68px;
-      width: 96px;
+      height: 56px;
+      width: 62px;
     }}
     .focus-tile-state .focus-tile-label {{
       font-size: 12px;
@@ -6186,26 +7648,10 @@ def make_html(
       font-size: 14px;
       border-top: 1px solid rgba(23,23,23,0.08);
     }}
-    body.presenter .page {{
-      width: min(1360px, calc(100% - 128px));
-    }}
     body.presenter .viz-block {{
       min-height: 100svh;
       padding-top: 24px;
       padding-bottom: 24px;
-    }}
-    body.presenter #chart-1 .section-kicker,
-    body.presenter #chart-1 .section-head,
-    body.presenter #chart-1 .plot-wrap,
-    body.presenter #chart-1 .custom-timeline {{
-      width: min(100%, 1260px);
-    }}
-    body.presenter .section-head {{
-      margin-bottom: 10px;
-    }}
-    body.presenter .custom-timeline {{
-      padding-top: 12px;
-      padding-bottom: 12px;
     }}
     a {{ color: var(--teal); }}
     .reveal-ready .viz-block,
@@ -6279,52 +7725,39 @@ def make_html(
     onload="renderMathInElement(document.body, {{delimiters: [{{left:'\\\\(',right:'\\\\)',display:false}},{{left:'\\\\[',right:'\\\\]',display:true}}]}})"></script>
 </head>
 <body>
+  <script>
+    (function(){{
+      try {{
+        if (new URLSearchParams(window.location.search).get("present") === "1") {{
+          document.body.classList.add("presenter");
+        }}
+      }} catch(e) {{}}
+    }})();
+  </script>
   <main class="page">
     <header style="--hero-bg: url('{bg_uri}')">
-
-      <h1>Why some county economies break out.</h1>
-      <div class="metric-definition">
-        <span class="score-label">Breakout Score</span>
-        <span class="katex-formula">\\[\\text{{Breakout Score}} = \\bar{{I}}_{{2020\\text{{--}}2024}} - \\bar{{I}}_{{1969\\text{{--}}1979}}, \\quad I_y = \\frac{{\\text{{county per-capita income}}_y}}{{\\text{{U.S. per-capita income}}_y}} \\times 100\\]</span>
-        Ten-year baseline (1969–1979) reduces sensitivity to early-era shocks; five-year endpoint average (2020–2024) smooths recent noise. U.S.&nbsp;=&nbsp;100 each year removes inflation and national growth.
+      <div class="hero-eyebrow">
+        <span class="hero-eyebrow-bar"></span>
+        <span class="hero-eyebrow-text">Data Visualization Final · CS 329E</span>
       </div>
-      <div class="metrics">
-        <div class="metric">
-          <div class="label">Outcome</div>
-          <div class="value">Income</div>
-          <div class="sub">BEA CAINC1 relative income-position change</div>
-        </div>
-        <div class="metric">
-          <div class="label">Production</div>
-          <div class="value">GDP</div>
-          <div class="sub">BEA CAGDP1/CAGDP2 county output and industry</div>
-        </div>
-        <div class="metric">
-          <div class="label">Human capital</div>
-          <div class="value">ACS</div>
-          <div class="sub">Bachelor's share and county traits</div>
-        </div>
-        <div class="metric">
-          <div class="label">Metro class</div>
-          <div class="value">RUCC</div>
-          <div class="sub">USDA ERS rural-urban continuum codes</div>
-        </div>
-        <div class="metric">
-          <div class="label">Model residuals</div>
-          <div class="value">Logit</div>
-          <div class="sub">L1 logistic breakout model + K-means county archetypes</div>
-        </div>
+      <h1>American Powerhouses: Economic Dominance within State Lines</h1>
+      <p class="hero-subtitle">A visual study of why a handful of U.S. states rival entire national economies — and how human capital, industry, and research compound inside them.</p>
+      <div class="hero-byline">
+        <span class="hero-byline-item">Robert Paine</span>
+        <span class="hero-byline-sep">·</span>
+        <span class="hero-byline-item">Ariana Silva</span>
+        <span class="hero-byline-sep">·</span>
+        <span class="hero-byline-item">Brandon Alsip</span>
+        <span class="hero-byline-sep">·</span>
+        <span class="hero-byline-item">Spring 2026</span>
+        <span class="hero-byline-sep">·</span>
+        <span class="hero-byline-item">The University of Texas at Austin</span>
       </div>
     </header>
 
     {chart_sections}
 
-    <section class="support-intro">
-      <div class="section-kicker">Appendix</div>
-      <h2>Supporting Evidence</h2>
-    </section>
-
-    {support_sections}
+{("" if not support_sections.strip() else '<section class="support-intro"><div class="section-kicker">Appendix</div><h2>Supporting Evidence</h2></section>' + support_sections)}
 
     <footer>
       Sources: BEA CAINC1 county personal income, BEA CAGDP1 county GDP, BEA CAGDP2 county GDP by industry, Census ACS 2023 profile variables, USDA ERS 2023 Rural-Urban Continuum Codes, and county GeoJSON from Plotly datasets. County GDP per person combines workplace GDP with resident population, so treat it as an economic-intensity proxy rather than a household welfare measure.
@@ -6415,8 +7848,8 @@ def make_html(
     }})();
 
     (function () {{
-      const control = document.querySelector(".custom-timeline[data-plot='story-1']");
-      const plot = document.getElementById("story-1");
+      const control = document.querySelector(".custom-timeline[data-plot='story-4']");
+      const plot = document.getElementById("story-4");
       if (new URLSearchParams(window.location.search).get("present") === "1") {{
         document.body.classList.add("presenter");
       }}
