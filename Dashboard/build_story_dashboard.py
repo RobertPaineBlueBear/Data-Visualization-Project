@@ -2087,6 +2087,168 @@ def metro_nonmetro_lens() -> go.Figure:
     return plot_layout(fig, height=760)
 
 
+def metro_nonmetro_lens_gdp() -> go.Figure:
+    story_path = CLEAN / "county_story_2023.csv"
+    rucc_path = RAW / "2023-rural-urban-continuum-codes.csv"
+    if not story_path.exists() or not rucc_path.exists():
+        fig = go.Figure()
+        fig.add_annotation(
+            text="Run Dashboard/build_story_dashboard.py and download USDA Rural-Urban Continuum Codes.",
+            showarrow=False, x=0.5, y=0.5,
+        )
+        return plot_layout(fig, height=520)
+
+    order = [
+        "Metro, 1M+", "Metro, 250k-1M", "Metro, <250k",
+        "Nonmetro urban, adjacent", "Nonmetro urban, remote",
+        "Nonmetro town, adjacent", "Nonmetro town, remote",
+        "Nonmetro rural, adjacent", "Nonmetro rural, remote",
+    ]
+    group_map = {
+        1: "Metro, 1M+", 2: "Metro, 250k-1M", 3: "Metro, <250k",
+        4: "Nonmetro urban, adjacent", 5: "Nonmetro urban, remote",
+        6: "Nonmetro town, adjacent", 7: "Nonmetro town, remote",
+        8: "Nonmetro rural, adjacent", 9: "Nonmetro rural, remote",
+    }
+
+    counties = pd.read_csv(story_path, dtype={"county_fips": str})
+    counties["county_fips"] = counties["county_fips"].str.zfill(5)
+    counties = counties[counties["county_fips"] != "36061"]  # drop Manhattan outlier
+    counties = counties[counties["acs_population"].fillna(0) >= 20000]
+    rucc_raw = pd.read_csv(rucc_path, dtype={"FIPS": str}, encoding="latin1")
+    rucc_wide = (
+        rucc_raw.pivot_table(
+            index=["FIPS", "State", "County_Name"],
+            columns="Attribute", values="Value", aggfunc="first",
+        )
+        .reset_index().rename_axis(None, axis=1)
+        .rename(columns={"FIPS": "county_fips", "RUCC_2023": "rucc_2023"})
+    )
+    rucc_wide["county_fips"] = rucc_wide["county_fips"].str.zfill(5)
+    rucc_wide["rucc_2023"] = pd.to_numeric(rucc_wide["rucc_2023"], errors="coerce")
+    rucc_wide["rucc_group"] = rucc_wide["rucc_2023"].map(group_map)
+    counties = counties.merge(rucc_wide[["county_fips", "rucc_group"]], on="county_fips", how="left")
+
+    value_col = "county_gdp_per_capita"
+    counties = counties.dropna(subset=["rucc_group", value_col]).copy()
+    counties["rucc_group"] = pd.Categorical(counties["rucc_group"], categories=order, ordered=True)
+    counties = counties.sort_values("rucc_group")
+
+    # Aggressive outlier trim for GDP — a few energy counties (Loving TX, etc.) move thousands of index points.
+    filtered_frames = []
+    removed_outliers = 0
+    for group in order:
+        subset = counties[counties["rucc_group"] == group].copy()
+        if subset.empty:
+            continue
+        values = subset[value_col].astype(float)
+        q1, q3 = values.quantile(0.25), values.quantile(0.75)
+        iqr = q3 - q1
+        if pd.isna(iqr) or iqr <= 0:
+            filtered_frames.append(subset); continue
+        lower, upper = q1 - 3.0 * iqr, q3 + 3.0 * iqr
+        mask = (values < lower) | (values > upper)
+        n_out = int(mask.sum())
+        # trim up to 5% of group as outliers to keep ridge readable
+        max_trim = max(2, int(0.05 * len(subset)))
+        if 1 <= n_out <= max_trim:
+            subset = subset.loc[~mask].copy()
+            removed_outliers += n_out
+        filtered_frames.append(subset)
+    counties = pd.concat(filtered_frames, ignore_index=True)
+
+    def to_rgba(hex_color: str, alpha: float) -> str:
+        hex_color = hex_color.lstrip("#")
+        r = int(hex_color[0:2], 16); g = int(hex_color[2:4], 16); b = int(hex_color[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+
+    group_values: dict[str, np.ndarray] = {}
+    for group in order:
+        vals = counties.loc[counties["rucc_group"] == group, value_col].dropna().to_numpy(dtype=float)
+        if len(vals):
+            group_values[group] = vals
+
+    all_values = np.concatenate(list(group_values.values()))
+    x_lo = float(np.quantile(all_values, 0.01))
+    x_hi = float(np.quantile(all_values, 0.98))
+    if x_hi <= x_lo:
+        x_lo, x_hi = float(all_values.min()), float(all_values.max())
+    pad = max(2000.0, 0.05 * (x_hi - x_lo))
+    grid = np.linspace(max(0.0, x_lo - pad), x_hi + pad, 320)
+
+    overall_median = float(np.median(all_values))
+    ridge_height = 0.82
+    fig = go.Figure()
+    y_positions = {group: float(len(order) - idx - 1) for idx, group in enumerate(order)}
+    for group in order:
+        if group not in group_values:
+            continue
+        vals = group_values[group]
+        y_base = y_positions[group]
+        median_val = float(np.median(vals))
+        color = COLORS["teal"] if median_val >= overall_median else COLORS["red"]
+        bandwidth = max(2500.0, min(12000.0, float(np.std(vals, ddof=0) * 0.35)))
+        kde = KernelDensity(kernel="gaussian", bandwidth=bandwidth)
+        kde.fit(vals.reshape(-1, 1))
+        density = np.exp(kde.score_samples(grid.reshape(-1, 1)))
+        max_density = float(density.max())
+        if max_density <= 0:
+            continue
+        density_scaled = density / max_density * ridge_height
+        x_poly = np.concatenate([grid, grid[::-1]])
+        y_poly = np.concatenate([y_base + density_scaled, np.full_like(grid, y_base)])
+        fig.add_trace(go.Scatter(
+            x=x_poly, y=y_poly, mode="lines",
+            line=dict(color=color, width=1.2),
+            fill="toself", fillcolor=to_rgba(color, 0.34),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=grid, y=y_base + density_scaled, mode="lines",
+            line=dict(color=color, width=2.0),
+            hovertemplate=(
+                f"<b>{group} (n={len(vals):,})</b><br>"
+                "County GDP per capita: $%{x:,.0f}<extra></extra>"
+            ),
+            showlegend=False,
+        ))
+    for group in order:
+        if group not in group_values:
+            continue
+        y_base = y_positions[group]
+        fig.add_shape(
+            type="line", x0=float(grid.min()), x1=float(grid.max()),
+            y0=y_base, y1=y_base,
+            line=dict(color="rgba(23,23,23,0.18)", width=1), layer="below",
+        )
+    covered = int(counties["county_fips"].nunique())
+    max_group = int(max(len(v) for v in group_values.values()))
+    tickvals = [y_positions[g] for g in order if g in group_values]
+    ticktext = [f"{g} (n={len(group_values[g]):,})" for g in order if g in group_values]
+    fig.update_layout(
+        title="County GDP per capita density by metro/nonmetro setting (2023)",
+        margin=dict(l=240, r=34, t=84, b=108),
+    )
+    fig.update_xaxes(title="County GDP per capita, 2023 (USD)", tickformat="$,.0f")
+    fig.update_yaxes(
+        title="", tickmode="array", tickvals=tickvals, ticktext=ticktext,
+        range=[-0.35, len(order) - 0.1], showgrid=False, zeroline=False,
+    )
+    note = (
+        "Ridgeline density view: each profile is a smoothed county distribution. "
+        f"Coverage: {covered:,} counties; largest group has {max_group:,} counties."
+    )
+    note += " Red = group median below overall median; teal = above. Manhattan and counties under 20k population excluded."
+    if removed_outliers > 0:
+        note += f" Trimmed {removed_outliers} extreme GDP-per-capita outlier(s) (energy/specialty counties that dwarf the rest)."
+    fig.add_annotation(
+        x=0.02, y=-0.22, xref="paper", yref="paper",
+        text=note, showarrow=False,
+        font=dict(size=12, color=COLORS["muted"]), align="left",
+    )
+    return plot_layout(fig, height=760)
+
+
 def industry_composition_lens() -> go.Figure:
     summary_path = CLEAN / "county_industry_mobility_summary.csv"
     if not summary_path.exists():
@@ -4767,7 +4929,212 @@ def state_mobility_distributions() -> go.Figure:
         dtick=1,
         tickfont=dict(size=10),
     )
-    fig = plot_layout(fig, height=760)
+    fig = plot_layout(fig, height=880)
+    fig.update_layout(margin=dict(l=148, r=34, t=86, b=86))
+    return fig
+
+
+def state_income_distributions_2023(income_panel: pd.DataFrame) -> go.Figure:
+    df = income_panel[income_panel["year"] == 2023].copy()
+    df = df[df["state_name"] != "District of Columbia"]
+    df = df[df["population"].fillna(0) >= 20000]
+    df = df[df["per_capita_personal_income"].notna()]
+    df = df[df["county_fips"] != "36061"]
+
+    grouped = df.groupby("state_name")
+    summary = grouped.apply(
+        lambda g: pd.Series({
+            "counties": len(g),
+            "pop_weighted": np.average(g["per_capita_personal_income"], weights=g["population"]),
+            "p25": g["per_capita_personal_income"].quantile(0.25),
+            "median": g["per_capita_personal_income"].median(),
+            "p75": g["per_capita_personal_income"].quantile(0.75),
+        }),
+        include_groups=False,
+    ).reset_index()
+
+    order = summary.sort_values("pop_weighted")["state_name"].tolist()
+    summary["state_name"] = pd.Categorical(summary["state_name"], categories=order, ordered=True)
+    df["state_name"] = pd.Categorical(df["state_name"], categories=order, ordered=True)
+    summary = summary.sort_values("state_name")
+
+    fig = go.Figure()
+    for _, row in summary.iterrows():
+        fig.add_shape(
+            type="line",
+            x0=row["p25"], x1=row["p75"],
+            y0=row["state_name"], y1=row["state_name"],
+            line=dict(color="#bdbdbd", width=7),
+            xref="x", yref="y", layer="below",
+        )
+    fig.add_trace(
+        go.Scatter(
+            x=df["per_capita_personal_income"],
+            y=df["state_name"],
+            mode="markers",
+            marker=dict(
+                size=np.clip(np.sqrt(df["population"]) / 92, 4, 22),
+                color="rgba(23, 23, 23, 0.32)",
+                line=dict(width=0),
+            ),
+            customdata=np.stack(
+                [df["bea_county_name"], df["population"], df["per_capita_personal_income"]],
+                axis=-1,
+            ),
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "%{y}<br>"
+                "Per-capita personal income: $%{customdata[2]:,.0f}<br>"
+                "2023 population: %{customdata[1]:,.0f}<extra></extra>"
+            ),
+            name="Counties",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=summary["pop_weighted"],
+            y=summary["state_name"],
+            mode="markers",
+            marker=dict(symbol="diamond", size=11, color=COLORS["teal"], line=dict(color="#ffffff", width=1)),
+            customdata=np.stack([summary["counties"], summary["median"], summary["p25"], summary["p75"]], axis=-1),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Pop-weighted per-capita income: $%{x:,.0f}<br>"
+                "Median county: $%{customdata[1]:,.0f}<br>"
+                "Middle 50%: $%{customdata[2]:,.0f} to $%{customdata[3]:,.0f}<br>"
+                "Counties shown: %{customdata[0]:.0f}<extra></extra>"
+            ),
+            name="State average",
+        )
+    )
+    fig.update_layout(
+        title="States differ on county per-capita personal income (2023 snapshot)",
+        legend=dict(orientation="h", y=-0.08, x=0),
+    )
+    fig.update_xaxes(
+        title="County per-capita personal income, 2023 (counties with pop ≥ 20k)",
+        tickformat="$,.0f",
+    )
+    fig.update_yaxes(
+        title="", categoryorder="array", categoryarray=order,
+        tickmode="linear", dtick=1, tickfont=dict(size=10),
+    )
+    fig = plot_layout(fig, height=880)
+    fig.update_layout(margin=dict(l=148, r=34, t=86, b=86))
+    return fig
+
+
+def state_gdp_distributions_2023(county_df: pd.DataFrame) -> go.Figure:
+    df = county_df.copy()
+    df = df[df["state_name"] != "District of Columbia"]
+    df = df[df["acs_population"].fillna(0) >= 20000]
+    df = df[df["county_gdp_per_capita"].notna()]
+    df = df[df["county_fips"] != "36061"]
+
+    grouped = df.groupby("state_name")
+    summary = grouped.apply(
+        lambda g: pd.Series({
+            "counties": len(g),
+            "pop_weighted_gdp": np.average(g["county_gdp_per_capita"], weights=g["acs_population"]),
+            "p25_gdp": g["county_gdp_per_capita"].quantile(0.25),
+            "median_gdp": g["county_gdp_per_capita"].median(),
+            "p75_gdp": g["county_gdp_per_capita"].quantile(0.75),
+        }),
+        include_groups=False,
+    ).reset_index()
+
+    order = summary.sort_values("pop_weighted_gdp")["state_name"].tolist()
+    summary["state_name"] = pd.Categorical(summary["state_name"], categories=order, ordered=True)
+    df["state_name"] = pd.Categorical(df["state_name"], categories=order, ordered=True)
+    summary = summary.sort_values("state_name")
+
+    fig = go.Figure()
+    for _, row in summary.iterrows():
+        fig.add_shape(
+            type="line",
+            x0=row["p25_gdp"],
+            x1=row["p75_gdp"],
+            y0=row["state_name"],
+            y1=row["state_name"],
+            line=dict(color="#bdbdbd", width=7),
+            xref="x",
+            yref="y",
+            layer="below",
+        )
+    fig.add_trace(
+        go.Scatter(
+            x=df["county_gdp_per_capita"],
+            y=df["state_name"],
+            mode="markers",
+            marker=dict(
+                size=np.clip(np.sqrt(df["acs_population"]) / 92, 4, 22),
+                color="rgba(23, 23, 23, 0.32)",
+                line=dict(width=0),
+            ),
+            customdata=np.stack(
+                [
+                    df["bea_county_name"],
+                    df["acs_population"],
+                    df["county_gdp_per_capita"],
+                ],
+                axis=-1,
+            ),
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "%{y}<br>"
+                "County GDP/capita: $%{customdata[2]:,.0f}<br>"
+                "2023 population: %{customdata[1]:,.0f}<extra></extra>"
+            ),
+            name="Counties",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=summary["pop_weighted_gdp"],
+            y=summary["state_name"],
+            mode="markers",
+            marker=dict(
+                symbol="diamond",
+                size=11,
+                color=COLORS["teal"],
+                line=dict(color="#ffffff", width=1),
+            ),
+            customdata=np.stack(
+                [
+                    summary["counties"],
+                    summary["median_gdp"],
+                    summary["p25_gdp"],
+                    summary["p75_gdp"],
+                ],
+                axis=-1,
+            ),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Population-weighted county GDP/capita: $%{x:,.0f}<br>"
+                "Median county: $%{customdata[1]:,.0f}<br>"
+                "Middle 50%: $%{customdata[2]:,.0f} to $%{customdata[3]:,.0f}<br>"
+                "Counties shown: %{customdata[0]:.0f}<extra></extra>"
+            ),
+            name="State average",
+        )
+    )
+    fig.update_layout(
+        title="States differ on county GDP per capita too (2023 snapshot)",
+        legend=dict(orientation="h", y=-0.08, x=0),
+    )
+    fig.update_xaxes(
+        title="County GDP per capita, 2023 (counties with pop ≥ 20k)",
+        tickformat="$,.0f",
+    )
+    fig.update_yaxes(
+        title="",
+        categoryorder="array",
+        categoryarray=order,
+        tickmode="linear",
+        dtick=1,
+        tickfont=dict(size=10),
+    )
+    fig = plot_layout(fig, height=880)
     fig.update_layout(margin=dict(l=148, r=34, t=86, b=86))
     return fig
 
@@ -4840,18 +5207,22 @@ def make_html(
             model_diagnostics(),
         ),
     ]
+    s1_income_fig = state_income_distributions_2023(county_income_panel)
+    s1_gdp_fig = state_gdp_distributions_2023(county)
+    s2_income_fig = metro_nonmetro_lens()
+    s2_gdp_fig = metro_nonmetro_lens_gdp()
     support_charts = [
         (
             "S1",
             "States Differ",
-            "Metric: distribution of county Breakout Scores within each state. Breakout Score = 2020–2024 avg relative-income index minus 1969–1979 avg.",
-            state_mobility_distributions(),
+            "Metric: distribution of county outcomes within each state, 2023 snapshot. Toggle between county per-capita personal income (BEA CAINC1, where residents live) and county GDP per capita (BEA CAGDP1, where production happens). Counties with population ≥ 20k. New York County (Manhattan) excluded as an outlier that dominates the axis on both views.",
+            s1_income_fig,
         ),
         (
             "S2",
             "Metro Lens",
-            "Metric: county Breakout Score grouped by USDA ERS 2023 Rural-Urban Continuum Code (metro vs nonmetro tiers).",
-            metro_nonmetro_lens(),
+            "Metric: county outcomes grouped by USDA ERS 2023 Rural-Urban Continuum Code (metro vs nonmetro tiers). Toggle between per-capita personal-income mobility (1969→2024 index change) and county GDP per capita in 2023 (level, not change).",
+            s2_income_fig,
         ),
         (
             "S3",
@@ -5001,8 +5372,44 @@ def make_html(
         chart_section_html(num, title, note, fig)
         for num, title, note, fig in charts
     )
-    support_sections = "\n".join(
-        f"""
+    def _support_block(num: str, title: str, note: str, fig: go.Figure) -> str:
+        if num == "S1":
+            income_html = fig_html(s1_income_fig, "support-S1-income")
+            gdp_html = fig_html(s1_gdp_fig, "support-S1-gdp")
+            return f"""
+      <section class="viz-block support-block" id="support-block-{num}">
+          <div class="section-kicker">Supporting Evidence {num}</div>
+          <div class="section-head">
+            <h2>{title}</h2>
+            <p>{note}</p>
+          </div>
+          <div class="s1-toggle" role="tablist">
+            <button type="button" class="s1-toggle-btn active" data-target="s1-income">Per-capita personal income (2023)</button>
+            <button type="button" class="s1-toggle-btn" data-target="s1-gdp">County GDP per capita (2023)</button>
+          </div>
+          <div class="plot-wrap s1-pane" data-pane="s1-income">{income_html}</div>
+          <div class="plot-wrap s1-pane" data-pane="s1-gdp" style="display:none;">{gdp_html}</div>
+        </section>
+        """
+        if num == "S2":
+            income_html = fig_html(s2_income_fig, "support-S2-income")
+            gdp_html = fig_html(s2_gdp_fig, "support-S2-gdp")
+            return f"""
+      <section class="viz-block support-block" id="support-block-{num}">
+          <div class="section-kicker">Supporting Evidence {num}</div>
+          <div class="section-head">
+            <h2>{title}</h2>
+            <p>{note}</p>
+          </div>
+          <div class="s1-toggle" role="tablist">
+            <button type="button" class="s1-toggle-btn active" data-target="s2-income">Personal-income mobility (1969→2024)</button>
+            <button type="button" class="s1-toggle-btn" data-target="s2-gdp">GDP per capita (2023)</button>
+          </div>
+          <div class="plot-wrap s1-pane" data-pane="s2-income">{income_html}</div>
+          <div class="plot-wrap s1-pane" data-pane="s2-gdp" style="display:none;">{gdp_html}</div>
+        </section>
+        """
+        return f"""
       <section class="viz-block support-block" id="support-block-{num}">
           <div class="section-kicker">Supporting Evidence {num}</div>
           <div class="section-head">
@@ -5012,6 +5419,9 @@ def make_html(
           <div class="plot-wrap">{fig_html(fig, f"support-{num}")}</div>
         </section>
         """
+
+    support_sections = "\n".join(
+        _support_block(num, title, note, fig)
         for num, title, note, fig in support_charts
     )
 
@@ -5309,6 +5719,31 @@ def make_html(
       padding: 12px;
       box-shadow: var(--shadow-soft);
       overflow: hidden;
+    }}
+    .s1-toggle {{
+      display: flex;
+      gap: 8px;
+      margin: 4px 0 10px;
+      flex-wrap: wrap;
+    }}
+    .s1-toggle-btn {{
+      font: inherit;
+      font-size: 13px;
+      padding: 6px 14px;
+      border-radius: 999px;
+      border: 1px solid rgba(23,23,23,0.24);
+      background: #ffffff;
+      color: var(--ink);
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }}
+    .s1-toggle-btn:hover {{
+      border-color: var(--ink);
+    }}
+    .s1-toggle-btn.active {{
+      background: var(--ink);
+      color: #ffffff;
+      border-color: var(--ink);
     }}
     .plot-wrap::before {{
       content: "";
@@ -6256,12 +6691,32 @@ def make_html(
       }}
       function init() {{
         const plot = document.getElementById("story-2");
-        if (!plot) return;
-        const tryAttach = function () {{
-          if (attachHandlers(plot)) return;
-          setTimeout(tryAttach, 100);
-        }};
-        tryAttach();
+        if (plot) {{
+          const tryAttach = function () {{
+            if (attachHandlers(plot)) return;
+            setTimeout(tryAttach, 100);
+          }};
+          tryAttach();
+        }}
+        const toggleBtns = document.querySelectorAll(".s1-toggle-btn");
+        toggleBtns.forEach(function (btn) {{
+          btn.addEventListener("click", function () {{
+            const target = btn.getAttribute("data-target");
+            const section = btn.closest("section");
+            if (!section) return;
+            section.querySelectorAll(".s1-toggle-btn").forEach(function (b) {{
+              b.classList.toggle("active", b === btn);
+            }});
+            section.querySelectorAll(".s1-pane").forEach(function (p) {{
+              const show = p.getAttribute("data-pane") === target;
+              p.style.display = show ? "" : "none";
+              if (show && window.Plotly) {{
+                const inner = p.querySelector(".js-plotly-plot");
+                if (inner) Plotly.Plots.resize(inner);
+              }}
+            }});
+          }});
+        }});
       }}
       if (document.readyState === "loading") {{
         document.addEventListener("DOMContentLoaded", init);
