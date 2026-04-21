@@ -6628,10 +6628,8 @@ def make_html(
         (
             "5",
             "Testing the Hypothesis: F500, R&D, Population",
-            "Two models of the same hypothesis. Level view (top): why each state sits where it does in 2023. Growth view (bottom): what explains who pulled ahead 2006→2023, using 2006 starting features only.",
-            (lambda: (lambda lvl, gro: setattr(lvl, "_companion_growth", gro) or lvl)(
-                state_hypothesis_panel_shap(), state_hypothesis_growth_cross_section()
-            ))(),
+            "Cross-sectional OLS, 50 states. Target: annualized GDP-per-capita growth 2006→2023. Features measured at 2006 only (no temporal leakage). Bars decompose each state's fitted deviation from the national mean growth rate.",
+            state_hypothesis_growth_cross_section(),
         ),
     ]
     support_charts: list = []
@@ -6663,52 +6661,24 @@ def make_html(
                 f'<div class="focus-only-wrap">{focus_html}</div>'
                 f'{hypothesis_html}'
             )
-        elif num == "5" and hasattr(fig, "_panel_metrics"):
-            m = fig._panel_metrics
+        elif num == "5" and hasattr(fig, "_panel_metrics_growth"):
+            g = fig._panel_metrics_growth
             metrics_card = f"""
             <div class="rf-metrics-card">
               <div class="rf-metrics-head">
-                <span class="rf-metrics-kicker">Model A · Level view (XGBoost panel + SHAP)</span>
-                <span class="rf-metrics-sub">50 states · 2006–2023 · time-based split · target: log GDP/cap in year t</span>
+                <span class="rf-metrics-kicker">Cross-sectional OLS · growth model</span>
+                <span class="rf-metrics-sub">50 states · 2006 features → 2006–2023 growth · no temporal leakage</span>
               </div>
               <div class="rf-metrics-grid">
-                <div class="rf-metric"><span class="rf-metric-label">Test R² ({m['years_test']})</span><span class="rf-metric-value">{m['test_r2']:.2f}</span></div>
-                <div class="rf-metric"><span class="rf-metric-label">Hypothesis-only R²</span><span class="rf-metric-value">{m['hyp_only_r2']:.2f}</span></div>
-                <div class="rf-metric"><span class="rf-metric-label">Train R² ({m['years_train']})</span><span class="rf-metric-value">{m['train_r2']:.2f}</span></div>
-                <div class="rf-metric"><span class="rf-metric-label">Holdout MAE</span><span class="rf-metric-value">${m['mae_usd']:,.0f}</span></div>
-                <div class="rf-metric"><span class="rf-metric-label">State-years</span><span class="rf-metric-value">{m['n']:,}</span></div>
-                <div class="rf-metric"><span class="rf-metric-label">Test rows</span><span class="rf-metric-value">{m['n_test']:,}</span></div>
+                <div class="rf-metric"><span class="rf-metric-label">R²</span><span class="rf-metric-value">{g.get('r2', float('nan')):.2f}</span></div>
+                <div class="rf-metric"><span class="rf-metric-label">Hypothesis-only R²</span><span class="rf-metric-value">{g.get('hyp_only_r2', float('nan')):.2f}</span></div>
+                <div class="rf-metric"><span class="rf-metric-label">States</span><span class="rf-metric-value">{g.get('n', 0)}</span></div>
+                <div class="rf-metric"><span class="rf-metric-label">Mean growth</span><span class="rf-metric-value">{g.get('mean_growth_pp', float('nan')):.2f} pp/yr</span></div>
+                <div class="rf-metric"><span class="rf-metric-label">Window</span><span class="rf-metric-value">{g.get('target_years', '')}</span></div>
               </div>
             </div>
             """
-            growth_fig = getattr(fig, "_companion_growth", None)
-            growth_block = ""
-            if growth_fig is not None:
-                g = getattr(growth_fig, "_panel_metrics_growth", {}) or {}
-                growth_metrics_card = f"""
-                <div class="rf-metrics-card">
-                  <div class="rf-metrics-head">
-                    <span class="rf-metrics-kicker">Model B · Growth view (cross-sectional OLS)</span>
-                    <span class="rf-metrics-sub">50 states · 2006 features → 2006–2023 growth · no temporal leakage</span>
-                  </div>
-                  <div class="rf-metrics-grid">
-                    <div class="rf-metric"><span class="rf-metric-label">R²</span><span class="rf-metric-value">{g.get('r2', float('nan')):.2f}</span></div>
-                    <div class="rf-metric"><span class="rf-metric-label">Hypothesis-only R²</span><span class="rf-metric-value">{g.get('hyp_only_r2', float('nan')):.2f}</span></div>
-                    <div class="rf-metric"><span class="rf-metric-label">States</span><span class="rf-metric-value">{g.get('n', 0)}</span></div>
-                    <div class="rf-metric"><span class="rf-metric-label">Mean growth</span><span class="rf-metric-value">{g.get('mean_growth_pp', float('nan')):.2f} pp/yr</span></div>
-                    <div class="rf-metric"><span class="rf-metric-label">Window</span><span class="rf-metric-value">{g.get('target_years', '')}</span></div>
-                  </div>
-                </div>
-                """
-                growth_block = (
-                    f'{growth_metrics_card}'
-                    f'<div class="plot-wrap">{fig_html(growth_fig, f"story-{num}-growth")}</div>'
-                )
-            plot_html = (
-                f'{metrics_card}'
-                f'<div class="plot-wrap">{fig_html(fig, f"story-{num}")}</div>'
-                f'{growth_block}'
-            )
+            plot_html = f'{metrics_card}<div class="plot-wrap">{fig_html(fig, f"story-{num}")}</div>'
         else:
             plot_html = f'<div class="plot-wrap">{fig_html(fig, f"story-{num}")}</div>'
         if is_atlas:
