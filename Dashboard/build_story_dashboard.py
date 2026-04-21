@@ -3195,6 +3195,243 @@ def county_growth_prediction() -> go.Figure:
     return plot_layout(fig, height=960)
 
 
+def state_hypothesis_panel_shap() -> go.Figure:
+    """State × year panel (2006–2023) testing the project hypothesis:
+    does F500 HQ density, R&D spending, and population explain state GDP/cap?
+
+    Design:
+      - Target: log(state GDP per capita) in year t.
+      - Hypothesis features: F500 per million, R&D per capita, log(population).
+      - Controls: 2006 baseline log(GDP/cap) — captures state fixed starting point;
+        2023 bachelor's share — slow-moving human-capital control; year index.
+      - Model: gradient-boosted trees (XGBoost), shallow.
+      - Time-based CV: train on 2006–2016, test on 2017–2023.
+      - SHAP TreeExplainer → per-observation decomposition.
+      - Visual: actual-vs-predicted (top) + 2023 SHAP stacked bars per state (bottom),
+        showing how much of each state's predicted GDP/cap above/below the panel
+        mean comes from the hypothesis trio vs. everything else.
+    """
+    panel_path = CLEAN / "merged_data.csv"
+    controls_path = CLEAN / "state_story_2023.csv"
+    if not (panel_path.exists() and controls_path.exists()):
+        fig = go.Figure()
+        fig.add_annotation(text="Required inputs missing.", showarrow=False, x=0.5, y=0.5)
+        return plot_layout(fig, height=620)
+
+    import xgboost as xgb
+
+    panel = pd.read_csv(panel_path).sort_values(["state", "year"]).copy()
+    # Drop DC — a city-state outlier on every hypothesis feature
+    panel = panel[panel["state"] != "District of Columbia"].copy()
+    panel["log_population"] = np.log(panel["population"].clip(lower=1))
+    panel["rd_per_capita"] = panel["research_spending"] * 1000 / panel["population"]
+    panel["f500_per_million"] = panel["f500_count"] / (panel["population"] / 1e6)
+    panel["log_gdp_per_capita"] = np.log(panel["gdp_per_capita"].clip(lower=1))
+
+    baseline = (
+        panel[panel["year"] == 2006][["state", "gdp_per_capita"]]
+        .rename(columns={"gdp_per_capita": "baseline_gdp_per_capita_2006"})
+    )
+    baseline["log_baseline_gdp_per_capita_2006"] = np.log(baseline["baseline_gdp_per_capita_2006"])
+    panel = panel.merge(baseline, on="state", how="left")
+
+    controls = pd.read_csv(controls_path)[["state", "bachelors_or_higher_pct"]].rename(
+        columns={"bachelors_or_higher_pct": "bachelors_pct_2023"}
+    )
+    panel = panel.merge(controls, on="state", how="left")
+
+    hypothesis_cols = ["f500_per_million", "rd_per_capita", "log_population"]
+    control_cols = ["log_baseline_gdp_per_capita_2006", "bachelors_pct_2023", "year"]
+    use_cols = hypothesis_cols + control_cols
+    pretty = {
+        "f500_per_million": "Fortune 500 per million",
+        "rd_per_capita": "R&D per capita",
+        "log_population": "Log population",
+        "log_baseline_gdp_per_capita_2006": "Log GDP/cap, 2006 (baseline)",
+        "bachelors_pct_2023": "Bachelor's or higher, 2023",
+        "year": "Year",
+    }
+
+    panel = panel.dropna(subset=[*use_cols, "log_gdp_per_capita"]).copy()
+    train = panel[panel["year"] <= 2016].copy()
+    test = panel[panel["year"] >= 2017].copy()
+
+    X_tr, y_tr = train[use_cols].values, train["log_gdp_per_capita"].values
+    X_te, y_te = test[use_cols].values, test["log_gdp_per_capita"].values
+    X_all = panel[use_cols].values
+    y_all = panel["log_gdp_per_capita"].values
+
+    model = xgb.XGBRegressor(
+        n_estimators=600, max_depth=4, learning_rate=0.04,
+        subsample=0.85, colsample_bytree=0.85,
+        reg_lambda=1.0, random_state=42, n_jobs=-1, tree_method="hist",
+    )
+    model.fit(X_tr, y_tr)
+
+    y_pred_te = model.predict(X_te)
+    test_r2 = float(1 - np.sum((y_te - y_pred_te) ** 2) / np.sum((y_te - y_te.mean()) ** 2))
+    train_r2 = float(model.score(X_tr, y_tr))
+    mae_usd = float(np.mean(np.abs(np.exp(y_pred_te) - np.exp(y_te))))
+
+    # Hypothesis-only vs. full model (ablation)
+    hyp_only = xgb.XGBRegressor(
+        n_estimators=600, max_depth=4, learning_rate=0.04,
+        subsample=0.85, colsample_bytree=0.85, reg_lambda=1.0,
+        random_state=42, n_jobs=-1, tree_method="hist",
+    )
+    hyp_only.fit(train[hypothesis_cols].values, y_tr)
+    hyp_only_r2 = float(1 - np.sum(
+        (y_te - hyp_only.predict(test[hypothesis_cols].values)) ** 2
+    ) / np.sum((y_te - y_te.mean()) ** 2))
+
+    # SHAP decomposition via XGBoost's built-in pred_contribs. Last column is the
+    # base/expected value (a.k.a. bias); the other columns are per-feature SHAP
+    # values that sum to (prediction - base) for each row.
+    booster = model.get_booster()
+    dmat = xgb.DMatrix(X_all, feature_names=use_cols)
+    contribs = booster.predict(dmat, pred_contribs=True)
+    shap_all = contribs[:, :-1]
+    base_value = float(contribs[0, -1])
+    shap_df = pd.DataFrame(shap_all, columns=use_cols, index=panel.index)
+    shap_df["state"] = panel["state"].values
+    shap_df["year"] = panel["year"].values
+
+    latest = shap_df[shap_df["year"] == 2023].copy()
+    latest["hypothesis_sum"] = latest[hypothesis_cols].sum(axis=1)
+    latest["control_sum"] = latest[control_cols].sum(axis=1)
+    latest["predicted_log"] = base_value + latest["hypothesis_sum"] + latest["control_sum"]
+    # Sort by predicted deviation from base (i.e. model's explanation of outperformance)
+    latest = latest.sort_values("predicted_log", ascending=False).reset_index(drop=True)
+    # Top 20 + bottom 10 for readability
+    show = pd.concat([latest.head(20), latest.tail(10)], ignore_index=True).drop_duplicates(subset=["state"])
+    show = show.sort_values("predicted_log", ascending=True).reset_index(drop=True)  # bottom→top for horizontal bars
+
+    # SHAP feature colors
+    shap_colors = {
+        "f500_per_million": COLORS["red"],
+        "rd_per_capita": COLORS["gold"],
+        "log_population": COLORS["teal"],
+        "log_baseline_gdp_per_capita_2006": "#8a8a8a",
+        "bachelors_pct_2023": "#b9a06a",
+        "year": "#cfcfcf",
+    }
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        row_heights=[0.32, 0.68],
+        subplot_titles=(
+            f"<b>Actual vs predicted</b>  ·  held-out years 2017–2023  ·  n={len(test):,}",
+            "<b>2023 SHAP decomposition</b>  ·  why each state sits above or below the panel average",
+        ),
+        vertical_spacing=0.14,
+    )
+
+    # Top panel — actual vs predicted, colored by year
+    y_tr_pred = model.predict(X_tr)
+    lo = float(min(y_all.min(), np.concatenate([y_tr_pred, y_pred_te]).min()))
+    hi = float(max(y_all.max(), np.concatenate([y_tr_pred, y_pred_te]).max()))
+    fig.add_trace(
+        go.Scatter(
+            x=y_tr, y=y_tr_pred, mode="markers",
+            marker=dict(size=6, color="#c9c9c9", line=dict(width=0), opacity=0.55),
+            name="Train (2006–2016)",
+            hovertemplate="Actual log GDP/cap: %{x:.3f}<br>Predicted: %{y:.3f}<extra>Train</extra>",
+        ),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=y_te, y=y_pred_te, mode="markers",
+            marker=dict(
+                size=9,
+                color=test["year"].values,
+                colorscale=[[0.0, COLORS["teal"]], [1.0, COLORS["gold"]]],
+                colorbar=dict(title="Test year", x=1.01, y=0.83, len=0.24, thickness=11,
+                              tickfont=dict(family=BODY_FONT, size=10, color=COLORS["ink"])),
+                line=dict(width=0.5, color="#ffffff"),
+            ),
+            customdata=np.stack([test["state"].values, test["year"].values], axis=-1),
+            hovertemplate="<b>%{customdata[0]}</b>, %{customdata[1]}<br>Actual: %{x:.3f}<br>Predicted: %{y:.3f}<extra>Test</extra>",
+            name="Test (2017–2023)",
+        ),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines",
+                   line=dict(color=COLORS["ink"], width=1.2, dash="dot"),
+                   hoverinfo="skip", showlegend=False),
+        row=1, col=1,
+    )
+
+    # Bottom panel — stacked SHAP bars per state (2023)
+    state_order = show["state"].tolist()
+    # Legend ordering: hypothesis trio first, then controls
+    feature_order = hypothesis_cols + control_cols
+    for feat in feature_order:
+        fig.add_trace(
+            go.Bar(
+                y=show["state"], x=show[feat],
+                orientation="h",
+                name=pretty[feat],
+                marker=dict(color=shap_colors[feat], line=dict(color="#ffffff", width=0.4)),
+                hovertemplate="<b>%{y}</b><br>" + pretty[feat] + ": %{x:+.3f} log units<extra></extra>",
+                legendgroup="hypothesis" if feat in hypothesis_cols else "controls",
+                legendgrouptitle_text=("<b>Hypothesis</b>" if feat in hypothesis_cols else "<b>Controls</b>"),
+            ),
+            row=2, col=1,
+        )
+
+    # Vertical zero reference
+    fig.add_vline(x=0, line=dict(color=COLORS["ink"], width=1.1), row=2, col=1)
+
+    fig.update_xaxes(title="Actual log GDP per capita", row=1, col=1, zeroline=False)
+    fig.update_yaxes(title="Predicted log GDP per capita", row=1, col=1, zeroline=False)
+    fig.update_xaxes(
+        title="SHAP contribution (log GDP/cap above or below panel mean)",
+        row=2, col=1, zeroline=False,
+    )
+    fig.update_yaxes(
+        categoryorder="array", categoryarray=state_order,
+        tickfont=dict(family=BODY_FONT, size=11, color=COLORS["ink"]),
+        automargin=True, row=2, col=1,
+    )
+
+    fig.update_layout(
+        barmode="relative",
+        legend=dict(
+            orientation="v", yanchor="top", y=0.62, xanchor="left", x=1.02,
+            bgcolor="rgba(255,255,255,0.92)", bordercolor=COLORS["ink"], borderwidth=1,
+            font=dict(family=BODY_FONT, size=11, color=COLORS["ink"]),
+            groupclick="toggleitem",
+        ),
+        margin=dict(l=120, r=180, t=64, b=96),
+    )
+
+    fig.add_annotation(
+        x=0.0, y=1.06, xref="paper", yref="paper", xanchor="left",
+        text=(
+            f"Panel: 50 states × 18 years, 2006–2023 (n={len(panel):,}). "
+            f"Target: log real GDP per capita. XGBoost, depth-4 · 600 trees · time-based split (train ≤2016, test ≥2017). "
+            f"Base value = panel mean log GDP/cap = {base_value:.2f}. Bars show SHAP contributions; "
+            "sum of all bars + base value = model's predicted log GDP/cap for that state in 2023."
+        ),
+        showarrow=False, align="left",
+        font=dict(family=BODY_FONT, size=12, color=COLORS["muted"]),
+    )
+
+    fig._panel_metrics = dict(
+        test_r2=test_r2,
+        train_r2=train_r2,
+        hyp_only_r2=hyp_only_r2,
+        mae_usd=mae_usd,
+        n=len(panel),
+        n_test=len(test),
+        years_train="2006–2016",
+        years_test="2017–2023",
+    )
+    return plot_layout(fig, height=1320)
+
+
 def state_human_capital_scatter(latest: pd.DataFrame) -> go.Figure:
     df = latest.sort_values("gdp_per_capita").copy()
     labels = set(df.head(5)["state"]) | set(df.tail(5)["state"]) | {"Texas", "California", "New York"}
@@ -6169,6 +6406,12 @@ CHART_SOURCES: dict[str, list[tuple[str, str, str, str | None]]] = {
         ("Fortune", "State F500 HQ density, 2006", "#a3162b", None),
         ("BEA", "CAGDP2 industry composition, 2001 (pre-period)", "#1463a1", "bea"),
     ],
+    "6": [
+        ("BEA", "State GDP per capita, 2006–2023 (target)", "#1463a1", "bea"),
+        ("Fortune", "State Fortune 500 HQ counts, 2006–2023", "#a3162b", None),
+        ("NSF NCSES", "State R&D spending, 2006–2023", "#1f4e79", "nsf"),
+        ("Census", "State population panel & ACS 2023 bachelor's share", "#003366", "census"),
+    ],
 }
 
 
@@ -6279,6 +6522,12 @@ def make_html(
             "Target: log-CAGR of total county employment (BEA CAEMP25N, number of jobs), 2001→2022 (winsorized at 1st/99th pct, counties with pop ≥ 5,000). Features grouped into three families — pre-period baselines (2001 GDP/population, 1969 income index, state R&D and F500 in 2006), structural/geographic (industry mix, rural-urban continuum, Census division), and slow-moving human capital (ACS 2023 education, occupations, migration, age, housing, QoL). Random Forest (800 trees, bootstrapped, sqrt-feature split). Left panel: held-out predictions with density underlay. Right panel: permutation importance on held-out set, with ±1.96·σ whiskers from 30 shuffle repeats and direction arrows (▲▼) for Spearman sign vs. the target.",
             county_growth_prediction(),
         ),
+        (
+            "6",
+            "Testing the Hypothesis: F500, R&D, Population",
+            "State × year panel, 2006–2023. Target: log state GDP per capita. Features split into three hypothesis levers (Fortune 500 per million residents, R&D per capita, log population) and three controls (2006 baseline log GDP/cap, 2023 bachelor's share, year). Gradient-boosted trees (XGBoost, depth-4, 600 trees) with a time-based split — train on 2006–2016, test on 2017–2023 — so the model is genuinely forecasting forward. Top panel validates the fit. Bottom panel shows SHAP contributions for 2023: each state's bar decomposes the model's predicted deviation from the panel-mean log GDP/cap into how much came from the hypothesis trio (red/gold/teal) vs. controls (greys). A state whose outperformance is dominated by the colored bars is one the hypothesis explains well.",
+            state_hypothesis_panel_shap(),
+        ),
     ]
     support_charts: list = []
     atlas_records = atlas_story_records()
@@ -6324,6 +6573,25 @@ def make_html(
                 <div class="rf-metric"><span class="rf-metric-label">Train R²</span><span class="rf-metric-value">{m['train_r2']:.2f}</span></div>
                 <div class="rf-metric"><span class="rf-metric-label">Counties</span><span class="rf-metric-value">{m['n']:,}</span></div>
                 <div class="rf-metric"><span class="rf-metric-label">Features</span><span class="rf-metric-value">{m['features']}</span></div>
+              </div>
+            </div>
+            """
+            plot_html = f'{metrics_card}<div class="plot-wrap">{fig_html(fig, f"story-{num}")}</div>'
+        elif num == "6" and hasattr(fig, "_panel_metrics"):
+            m = fig._panel_metrics
+            metrics_card = f"""
+            <div class="rf-metrics-card">
+              <div class="rf-metrics-head">
+                <span class="rf-metrics-kicker">XGBoost panel + SHAP</span>
+                <span class="rf-metrics-sub">50 states · 2006–2023 · time-based split</span>
+              </div>
+              <div class="rf-metrics-grid">
+                <div class="rf-metric"><span class="rf-metric-label">Test R² ({m['years_test']})</span><span class="rf-metric-value">{m['test_r2']:.2f}</span></div>
+                <div class="rf-metric"><span class="rf-metric-label">Hypothesis-only R²</span><span class="rf-metric-value">{m['hyp_only_r2']:.2f}</span></div>
+                <div class="rf-metric"><span class="rf-metric-label">Train R² ({m['years_train']})</span><span class="rf-metric-value">{m['train_r2']:.2f}</span></div>
+                <div class="rf-metric"><span class="rf-metric-label">Holdout MAE</span><span class="rf-metric-value">${m['mae_usd']:,.0f}</span></div>
+                <div class="rf-metric"><span class="rf-metric-label">State-years</span><span class="rf-metric-value">{m['n']:,}</span></div>
+                <div class="rf-metric"><span class="rf-metric-label">Test rows</span><span class="rf-metric-value">{m['n_test']:,}</span></div>
               </div>
             </div>
             """
@@ -7857,6 +8125,7 @@ def make_html(
     <a href="#chart-3" class="mini-nav-dot" data-mini-nav="chart-3"><span class="mini-nav-label">Visual 3 · State Engines</span><span class="mini-nav-dot-shape"></span></a>
     <a href="#chart-4" class="mini-nav-dot" data-mini-nav="chart-4"><span class="mini-nav-label">Visual 4 · Quality of Life</span><span class="mini-nav-dot-shape"></span></a>
     <a href="#chart-5" class="mini-nav-dot" data-mini-nav="chart-5"><span class="mini-nav-label">Visual 5 · Random Forest</span><span class="mini-nav-dot-shape"></span></a>
+    <a href="#chart-6" class="mini-nav-dot" data-mini-nav="chart-6"><span class="mini-nav-label">Visual 6 · Hypothesis SHAP</span><span class="mini-nav-dot-shape"></span></a>
   </nav>
   <main class="page">
     <header style="--hero-bg: url('{bg_uri}')">
