@@ -3521,7 +3521,7 @@ def state_hypothesis_growth_cross_section() -> go.Figure:
     fig.update_layout(
         barmode="relative",
         title=dict(
-            text="<b>2006 → 2023 growth decomposition</b>  ·  OLS attribution using 2006 starting features (no temporal leakage)",
+            text="<b>2006 → 2023 growth decomposition</b>  ·  OLS attribution using 2006 starting features",
             x=0.0, xanchor="left",
             font=dict(family=BODY_FONT, size=15, color=COLORS["ink"]),
         ),
@@ -6633,7 +6633,7 @@ def make_html(
         (
             "5",
             "Testing the Hypothesis: F500, R&D, Population",
-            "Cross-sectional OLS, 50 states. Target: annualized GDP-per-capita growth 2006→2023. Features measured at 2006 only (no temporal leakage). Bars decompose each state's fitted deviation from the national mean growth rate.",
+            "Cross-sectional OLS, 50 states. Target: annualized GDP-per-capita growth 2006→2023. Features measured at 2006 only. Bars decompose each state's fitted deviation from the national mean growth rate.",
             state_hypothesis_growth_cross_section(),
         ),
     ]
@@ -6672,7 +6672,7 @@ def make_html(
             <div class="rf-metrics-card">
               <div class="rf-metrics-head">
                 <span class="rf-metrics-kicker">Cross-sectional OLS · growth model</span>
-                <span class="rf-metrics-sub">50 states · 2006 features → 2006–2023 growth · no temporal leakage</span>
+                <span class="rf-metrics-sub">50 states · 2006 features → 2006–2023 growth</span>
               </div>
               <div class="rf-metrics-grid">
                 <div class="rf-metric"><span class="rf-metric-label">R²</span><span class="rf-metric-value">{g.get('r2', float('nan')):.2f}</span></div>
