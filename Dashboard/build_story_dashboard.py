@@ -6055,8 +6055,8 @@ def world_top30_economies(latest: pd.DataFrame) -> go.Figure:
 
     fig.update_geos(
         projection_type="natural earth",
-        projection_scale=1.15,
-        center=dict(lat=18, lon=10),
+        projection_scale=1.05,
+        center=dict(lat=14, lon=10),
         showland=True,
         landcolor="#f3ecde",
         showocean=True,
@@ -6073,6 +6073,9 @@ def world_top30_economies(latest: pd.DataFrame) -> go.Figure:
         domain=dict(x=[0, 1], y=[0, 1]),
     )
     fig.update_layout(
+        width=1120,
+        height=580,
+        autosize=False,
         margin=dict(l=0, r=0, t=0, b=28),
         annotations=[
             dict(
@@ -6082,7 +6085,9 @@ def world_top30_economies(latest: pd.DataFrame) -> go.Figure:
             )
         ],
     )
-    return plot_layout(fig, height=560)
+    fig = plot_layout(fig, height=580)
+    fig.update_layout(width=1120, height=580, autosize=False)
+    return fig
 
 
 def state_mobility_distributions() -> go.Figure:
